@@ -1,0 +1,51 @@
+[package]
+name = "service"
+description = "THE program: this deployment's provider code. One upstream per binary — edit src/provider.rs, which ships an OpenAI-dialect implementation as its starting point."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "service"
+path = "src/lib.rs"
+
+[[bin]]
+# Rename this to whatever you deploy as; nothing in the workspace depends on
+# the binary's name, which is the point of the crate not being named after a
+# vendor any more.
+name = "x2api"
+path = "src/main.rs"
+
+[dependencies]
+x2api-kit = { workspace = true }
+x2api-transport = { workspace = true }
+x2api-dialects = { workspace = true }
+x2api-server = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+async-stream = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+http = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+# The provider reads `Retry-After` as an HTTP-date, and `errors.rs` assigns that
+# job to the provider rather than to the shared gate — so the parser lives here
+# with the policy, and the crate that owns the policy needs the clock type.
+jiff = { workspace = true }
+clap = { workspace = true }
+mimalloc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+parking_lot = { workspace = true }
+metrics = { workspace = true }
+metrics-util = { version = "0.20.4", features = ["debugging"] }

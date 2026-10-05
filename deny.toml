@@ -1,0 +1,29 @@
+[advisories]
+version = 2
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[licenses]
+version = 2
+# Workspace crates now inherit the repository's MIT license from
+# [workspace.package]. The temporary UNLICENSED/private-ignore carve-out has
+# been removed.
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "LGPL-2.1-or-later",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Unlicense",
+  "Zlib",
+]

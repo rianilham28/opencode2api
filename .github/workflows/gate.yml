@@ -1,0 +1,344 @@
+# The same gate the git hook runs, on every push — because a hook is per-clone and
+# silently absent when `mise.toml` is untrusted, when the clone predates `mise
+# install`, or after `--no-verify`. `gate` and `release` keep one hk command per
+# verification purpose; supporting setup, pin checks, and artifact upload steps are
+# named rather than smuggled into parallel cargo steps.
+#
+# `gate` mirrors `hk check --all`, then runs the one dependency policy check in
+# cargo-deny's official Docker environment; hk also exposes the opt-in `hk deny`
+# group for developers who install the binary. `release` is the opt-in profile;
+# `msrv` uses a second compiler; `no-network` proves loopback-only tests; `bench`
+# produces a manual baseline candidate; `unit` verifies distribution files; and
+# `changes` decides which code-shaped jobs run. These are deliberately distinct
+# claims, not multiple spellings of the same Cargo build.
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: gate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# `on: push:` is unfiltered, so a burst of pushes to one ref queues a full chain
+# per push. Superseded branch runs are cancelled; MAIN'S RUNS ARE NEVER CANCELLED,
+# because the green on main is the authoritative claim for the commit someone is
+# waiting on, and throwing it away to build a newer commit trades a verification
+# for a minute of saved minutes — the inverse of the thing this file exists for.
+concurrency:
+  group: gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+
+  # What `release`'s 6-9 minutes are actually buying on this push. The predicate
+  # errs toward RUNNING, and the reasons are concrete rather than defensive: an
+  # empty or unresolvable base (fresh branch, force-push, shallow clone) cannot be
+  # classified, and a guard that skips when it cannot see is the decorative-guard
+  # failure wearing a new costume. The docs tree is split rather than taken whole:
+  # `docs/compliance/fixtures/**` are bytes the golden tests parse, so they count,
+  # while `docs/*.md` is prose and must not hold a release build hostage.
+  #
+  # Scoped to THIS job alone on purpose: workflow-level `on.push.paths` would also
+  # stop `gate` and `msrv` from ever seeing a `Cargo.toml`-only change, which is
+  # precisely the coverage this file exists to add.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.probe.outputs.code }}
+    steps:
+      # Node24-runtime release pinned by SHA; the `changes` job is this job's
+      # prerequisite, so a job that cannot start also silences every gated job.
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          fetch-depth: 0
+      - name: Classify the push
+        id: probe
+        run: |
+          base="${{ github.event.before }}"
+          sha="${{ github.sha }}"
+          if [ -z "$base" ] \
+            || [ "$base" = "0000000000000000000000000000000000000000" ] \
+            || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "no usable base ($base); running the release gate"
+            exit 0
+          fi
+          if git diff --name-only "$base" "$sha" \
+            | grep -qE '^(crates/|bench/|docs/compliance/fixtures/|deploy/|config|Cargo\.(toml|lock)$|deny\.toml$|hk\.pkl$|mise\.toml$|rust-toolchain\.toml$|\.env\.example$|\.gitattributes$|\.github/workflows/)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "code-shaped files in ${base:0:7}..${sha:0:7}"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "prose-only push; skipping the release gate"
+          fi
+
+
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        # `hk check --pr` resolves the diff against a base ref; a depth-1 clone
+        # cannot. `--all` is what runs here (see the step below), but keeping the
+        # history means the same config works for a PR-scoped run if that is ever
+        # switched on.
+        with:
+          fetch-depth: 0
+
+      # Deliberately NO dtolnay/rust-toolchain: mise.toml pins `rust` to the same
+      # channel as rust-toolchain.toml, and letting both managers install a compiler
+      # is how CI ends up checking a different one than the hook used locally.
+      - name: Assert toolchain and hk pins match
+        shell: bash
+        run: |
+          set -euo pipefail
+          mise_rust=$(sed -nE 's/^rust = "([^"]+)"$/\1/p' mise.toml)
+          toolchain_rust=$(sed -nE 's/^channel = "([^"]+)"$/\1/p' rust-toolchain.toml)
+          mise_hk=$(sed -nE 's/^hk = "([^"]+)"$/\1/p' mise.toml)
+          pkl_hk=$(sed -nE 's/^min_hk_version = "([^"]+)"$/\1/p' hk.pkl)
+          url_hk=$(sed -nE 's|^amends "package://github\.com/jdx/hk/releases/download/v[^/]+/hk@([^#]+)#/Config\.pkl"$|\1|p' hk.pkl)
+          test "$mise_rust" = "$toolchain_rust"
+          test "$mise_hk" = "$pkl_hk"
+          test "$mise_hk" = "$url_hk"
+
+      - uses: jdx/mise-action@v2
+
+      # NOT optional insurance, and it is here because the first run of this
+      # workflow failed with `'cargo-fmt' is not installed for the toolchain
+      # '1.98.0-x86_64-unknown-linux-gnu'`: mise's rust backend provisions the
+      # toolchain but does NOT apply the `components` list that
+      # rust-toolchain.toml declares, so a comment claiming it was inherited was
+      # exactly the unverified assumption this file keeps having to retract. fmt and
+      # clippy are the job's purpose, so the components are named out loud.
+      - name: Add the lint components
+        run: rustup component add rustfmt clippy
+
+      - name: Check dependency advisories and licenses
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --locked --all-features
+          command-arguments: advisories licenses
+        # Workspace packages now inherit the repository MIT license. The former
+        # UNLICENSED/private-ignore carve-out is removed from deny.toml.
+      - uses: Swatinem/rust-cache@v2
+
+      # One command, because `hk check --all` IS the chain: fmt, clippy
+      # -D warnings, the workspace test suite, the text-hygiene builtins, and
+      # actionlint on `.github/workflows/*.yml` — so this file validates itself in
+      # the run it exists to protect, rather than being checked by a step that
+      # only runs after the thing it guards has passed.
+      - name: Gate
+        run: mise exec -- hk check --all
+
+  # The axis worth a second job is the COMPILER, not the distribution: the binary
+  # is built on the target box by hand (docs/production.md step 2), so there is no
+  # per-distro artifact for a matrix to publish and every runner would compile the
+  # same portable code. `rust-version` is the one claim that genuinely differs
+  # across versions — and it was wrong until someone built it.
+  #
+  # The floor is READ out of the manifest instead of typed here a second time: two
+  # copies of a version is the failure this repo keeps documenting (a mise shim
+  # overrode the pinned toolchain and the drift looked like a linting mystery).
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the declared floor
+        id: floor
+        run: |
+          floor=$(sed -nE 's/^rust-version = "([^"]+)"/\1/p' Cargo.toml | head -1)
+          if [ -z "$floor" ]; then
+            echo "no rust-version in Cargo.toml" >&2
+            exit 1
+          fi
+          echo "toolchain=$floor" >> "$GITHUB_OUTPUT"
+          echo "checking the workspace on rustc $floor"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ steps.floor.outputs.toolchain }}
+
+      # `rustup run <toolchain>` for ONE command, not a toolchain manager: the gate
+      # job rejects `dtolnay/rust-toolchain` precisely because two managers fight
+      # over PATH, and this job needs no installer at all — no mise, no hk, no
+      # components, since `cargo check` is the whole assertion.
+      #
+      # `--locked` is not about resolution — cargo honours a complete, matching
+      # `Cargo.lock` and does NOT re-resolve on a check, so the older-deps story
+      # people reach for here does not apply. It is about inputs and attribution:
+      # the build uses the byte-identical graph that ships, it fails loudly when
+      # `Cargo.toml` and `Cargo.lock` disagree (a manifest edit with a stale lock
+      # would otherwise test a graph nobody runs), and a red run then says "this
+      # lock cannot build at the declared floor" instead of "the code cannot build".
+      - name: Check the workspace on the floor
+        run: |
+          rustup toolchain install "${{ steps.floor.outputs.toolchain }}" --profile minimal
+          rustup run "${{ steps.floor.outputs.toolchain }}" cargo check --locked --workspace --all-targets
+
+  # The profile that actually ships. Bring-up step 2 installs
+  # `target/release/x2api`, built with `lto = "fat"`, `codegen-units = 1`,
+  # `strip = true` — and deliberately WITHOUT `panic = "abort"`, because the
+  # panic->500 layer and `StreamOutcome`'s `panicked` outcome depend on unwinding.
+  # Until this job existed nothing in the repository had ever compiled that
+  # profile: the artifact a deploy ships was the one build the suite never
+  # touched, so debug green proved logic, not that the optimizer agrees with it.
+  #
+  # COST, measured on this workflow: 9.1m cold, 6.5m with the deps cache restored
+  # (232 MB, full key match). Warm is not near-zero because rust-cache saves
+  # dependency artifacts while the workspace's own fat-LTO pass is the job; that is
+  # also why `changes` exists rather than another always-on 6-9m job.
+  #
+  # THAT IT CAN GO RED, which a command wrapped twice over does not get to assume.
+  # Both links were tested: `cargo test --release` distinguishes the profile (a
+  # `if !cfg!(debug_assertions) { panic!() }` test passes in debug and fails in
+  # release), and the failure reaches the job through `mise exec -- hk` — a
+  # deliberately failing step exits 1 with `✗ cargo-test-release`. `fix` is set to
+  # the identical command, so neither mode can silently skip it.
+  #
+  # Its own hook GROUP in hk.pkl, not a member of `cargo_gate`: every member of that
+  # Mapping is also a step of the pre-commit hook, and a hook that takes minutes is
+  # a hook that gets bypassed with `--no-verify`.
+  release:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.arch }}
+      - name: Release-profile gate (${{ matrix.arch }})
+        run: mise exec -- hk run release -c --all
+
+  # The one genuinely distribution-shaped check here, and it is about the UNIT, not
+  # the Rust: `StateDirectory`, `LogsDirectory`, `ConfigurationDirectoryMode` and
+  # `ProtectSystem=strict` are systemd directives, and `docs/production.md` asserted
+  # they parsed clean from a hand-run fedora container that nothing re-runs. This
+  # makes that dated claim executable, on both architectures the operator deploys
+  # (linux x64 + arm64) — one body, one matrix, so the two legs cannot drift.
+  #
+  # Docker on a plain runner, NOT `container:`: a job's container mapping has no
+  # `platform` key, and the arm64 leg needs `--platform linux/arm64` under QEMU
+  # (setup-qemu below). Measured by hand before being written:
+  # - fedora:43 ships NO `systemd-analyze` — the parser is installed;
+  # - the verifier RESOLVES `ExecStart`: with no binary at that path it exits 1 on
+  #   "Command /usr/local/bin/x2api is not executable", so the stub is load-bearing;
+  # - with the stub, the unit verifies with empty output on amd64, and the arm64 leg
+  #   was proven the same way locally (native arm on Apple Silicon) before landing.
+  # The predicate fails on non-zero rc (proven by the missing-stub case) AND on
+  # non-empty output (where the tool's `Unknown key … ignoring` note for a directive
+  # typo surfaces; whether that note moves rc was NOT measured — which is why the
+  # guard takes either, not just the code).
+  #
+  # `fedora:43` stays a FLOATING tag on purpose: the parser's version is the thing
+  # under test, and digest-pinning would freeze a stale systemd and silence exactly
+  # the regression this job exists to catch. `:43` floats patches, not the major.
+  # The pinned `User=x2api` needs no account created (verified).
+  #
+  # Both legs must be allowed to finish independently: the point of two
+  # architectures is LEARNING whether a parse note is arch-specific, and fail-fast
+  # would cancel the amd64 leg on an arm64 red — destroying the comparison this
+  # matrix exists to make.
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the parser in fedora:43
+        run: |
+          if [ "${{ matrix.platform }}" = "linux/arm64" ]; then
+            # Only the emulated leg needs the handler; amd64 runs natively.
+            # QEMU registration is needed BEFORE the docker run that uses it.
+            docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+          fi
+          set -eu
+          docker run --rm --platform "${{ matrix.platform }}" \
+            -v "$PWD/deploy":/d:ro fedora:43 bash -lc 'inner() {
+            set -eu
+            dnf -q -y install systemd
+            mkdir -p /usr/local/bin
+            for b in x2api; do
+              printf "#!/bin/sh\n" > "/usr/local/bin/$b"
+              chmod +x "/usr/local/bin/$b"
+            done
+            cd /d
+            for u in x2api; do
+              if ! out=$(systemd-analyze verify "$u.service" 2>&1); then
+                printf "::error::%s.service failed to verify (on %s):\n%s\n" "$u" "$1" "$out"
+                exit 1
+              fi
+              if [ -n "$out" ]; then
+                printf "::error::%s.service parsed with notes (on %s):\n%s\n" "$u" "$1" "$out"
+                exit 1
+              fi
+              echo "$u.service ($1): clean"
+            done
+            }; inner "${{ matrix.platform }}"'
+
+  no-network:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      # Fetch while the runner can reach registries: a cache miss still needs the
+      # dependency sources, and the claim under test is that test execution—not setup—
+      # uses only loopback mocks and succeeds with external network blocked.
+      - name: Fetch locked dependencies
+        run: mise exec -- cargo fetch --locked
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: no-network
+      - name: Run workspace tests with external network blocked
+        # Proxy env is deliberately test-step-only; setup must remain able to download.
+        env:
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          NO_PROXY: localhost,127.0.0.1
+        run: mise exec -- cargo test --locked --workspace --all-targets
+
+  bench:
+    needs: changes
+    if: >-
+      needs.changes.outputs.code == 'true' &&
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+      - name: Compile and run the benchmark
+        run: mise exec -- cargo run --release --locked -p x2api-bench -- --json > run.json
+        # Artifact and compile/run proof only: shared-runner deltas are noise, so
+        # enforcing a latency threshold would produce false gates. No --baseline.
+      - name: Upload benchmark baseline candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-run-${{ github.sha }}
+          path: run.json
+          if-no-files-found: error

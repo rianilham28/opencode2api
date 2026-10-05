@@ -1,0 +1,25 @@
+{
+  "id": "chatcmpl-Az14Q",
+  "object": "chat.completion",
+  "created": 1757000100,
+  "model": "gpt-4o-mini-2026-04-14",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "14 C and foggy.",
+        "tool_calls": [
+          {
+            "id": "call_5kd2",
+            "type": "function",
+            "function": { "name": "get_weather", "arguments": "{\"city\":\"SF\"}" }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": { "prompt_tokens": 41, "completion_tokens": 12, "total_tokens": 53 },
+  "system_fingerprint": "fp_2c4a1f9e33"
+}

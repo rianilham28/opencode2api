@@ -1,0 +1,9 @@
+/target
+/config.json
+config.local.json
+*.local.json
+*.log
+.env
+
+# transient research scratch (durable reports live in docs/)
+/local/

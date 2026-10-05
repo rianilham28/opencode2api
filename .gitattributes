@@ -1,0 +1,26 @@
+# Nothing in this repo has a reason for its checkout bytes to differ from its
+# blob bytes: the proxy deploys and is gated on Linux, and two classes of file
+# are byte-contracts rather than editable text.
+* text=auto eol=lf
+
+# Vendored and byte-contracted: a vendored bundle may be byte-identical to the
+# file its upstream publishes, whose copy ends on a `;` with no trailing
+# newline. A line-ending conversion is corruption here, not style.
+#
+# Matched by directory ROLE rather than crate NAME, which is load-bearing twice
+# over in a template that gets forked: the rename recipe (R2) seds sources,
+# manifests and templates but not this file, so a path naming the crate would
+# either trip its residue gate or survive the rename pointing at a directory
+# that no longer exists — silently unprotecting the asset. And `hk.pkl` guards
+# the same bytes with `local vendored = List("**/assets/**")`, so sharing that
+# one glob means the two contracts cannot drift apart.
+**/assets/** binary
+
+# Captured vendor traffic. The golden tests assert against these frames, and the
+# SSE decoder's own contract distinguishes LF from CRLF framing, so a checkout
+# that rewrites them makes the fixture say something no vendor ever said.
+docs/compliance/fixtures/**/*.sse binary
+
+*.png binary
+*.ico binary
+*.woff2 binary

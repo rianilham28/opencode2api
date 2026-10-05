@@ -1,0 +1,91 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "bench"]
+
+[workspace.package]
+license = "MIT"
+
+version = "0.1.0"
+edition = "2024"
+# The floor is what the graph resolves at, not what the code was first written
+# against: 1.85 was a historical accident while `askama@0.16` and the `icu_*`
+# stack behind `url`/`idna` both declare 1.88, so `cargo check` on 1.85 failed at
+# resolution ("rustc 1.85 is not supported by the following packages") and nothing
+# caught it because no build ever ran the declared floor. Both directions were
+# measured on this tree — 1.85 fails, 1.88 passes `--workspace --all-targets` —
+# and `gate.yml`'s `msrv` job re-runs the check on every push so this line cannot
+# quietly become fiction again.
+rust-version = "1.88"
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+
+[workspace.dependencies]
+# --- internal crates (every service bin depends on these three) ---
+x2api-kit = { path = "crates/x2api-kit" }
+x2api-dialects = { path = "crates/x2api-dialects" }
+x2api-server = { path = "crates/x2api-server" }
+x2api-transport = { path = "crates/x2api-transport" }
+
+# --- runtime / web ---
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "macros", "signal", "sync", "time"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "tokio", "macros", "json", "query", "original-uri"] }
+askama = { version = "0.16", default-features = false, features = ["derive", "std", "config"] }
+tower-http = { version = "0.7.0", features = ["cors", "limit", "trace", "catch-panic"] }
+http = "1"
+
+# --- upstream transport ---
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls",
+    "http2",
+    "gzip",
+    "system-proxy",
+    "socks",
+] }
+
+# --- bytes / streams ---
+bytes = "1.12.1"
+memchr = "2.8.3"
+futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
+async-stream = "0.3.6"
+async-trait = "0.1"
+
+# --- serde ---
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+# --- observability ---
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+metrics = "0.24"
+# Pinned without default features deliberately: the exporter's built-in HTTP
+# listener would open a second port; `/metrics` is rendered through the router.
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+
+# --- misc ---
+anyhow = "1.0.104"
+clap = { version = "4", features = ["derive", "env"] }
+mimalloc = { version = "0.1.52", default-features = false }
+jiff = { version = "0.2.35", features = ["tz-system"] }
+parking_lot = "0.12"
+
+[profile.dev]
+# Line tables only: shrinks the target dir massively and speeds incremental
+# builds; full debuginfo is rarely needed for this code shape.
+debug = "line-tables-only"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+debug = false
+# No `panic = "abort"`: a panic while serving one request unwinds that task
+# only, so the proxy keeps serving everything else. The panic->500 layer in
+# x2api-server depends on unwinding.

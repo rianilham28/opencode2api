@@ -1,0 +1,267 @@
+// hk — git hook + repo check runner (https://hk.jdx.dev) for the x2api workspace.
+//
+// This file DEFINES the gate; mise.toml's `[hooks] postinstall = "hk install --mise"`
+// REGISTERS it, so `mise trust && mise install` on a fresh clone writes
+// `.git/hooks/pre-commit` and `hk uninstall` reverses it. Two ways to end up
+// thinking you are gated when you are not, both worth knowing:
+//   * an UNTRUSTED mise.toml runs no postinstall at all (mise warns and moves on),
+//     so the repo looks set up and every commit is ungated;
+//   * the gate's steps glob `**/*.rs`, so a commit that touches only docs/config
+//     legitimately skips fmt/clippy/test by design — `hk check --all` is the
+//     command that runs the whole gate regardless of what you staged.
+// The reason it was originally left opt-in still applies to the FIRST run: clippy
+// compiles the whole workspace cold, so expect minutes before the cache exists.
+//
+// The `hk` binary is pinned in mise.toml, and MUST equal `min_hk_version` and the
+// release in the `amends` URL below: this file amends a package at one specific
+// release, so a newer binary with an older schema (or the reverse) is a gate that
+// silently runs different commands than the ones documented here.
+
+amends "package://github.com/jdx/hk/releases/download/v1.55.0/hk@1.55.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v1.55.0/hk@1.55.0#/Builtins.pkl"
+
+// The package URL is pinned to the same release as min_hk_version: an unpinned
+// `amends` would let a new hk release redefine a builtin's default command and
+// silently change what this gate accepts with no diff here to review.
+min_hk_version = "1.55.0"
+
+// The project gate is fmt -> clippy -D warnings -> tests. All three are whole-
+// workspace cargo invocations sharing one target-dir lock, so `depends` does two
+// jobs: it fixes the order (formatting churn under a `-D warnings` run wastes a full
+// compile before fmt rejects it) and it keeps three cargo processes from blocking
+// each other in an order hk would otherwise pick freely. Mapping order alone does
+// not: hk runs a hook's steps concurrently by default.
+// Text hygiene and workflow validation: cheap, whole-repo, and each one catches
+// a class the compiler cannot see at all. `detect-private-key` is not
+// decoration in a repository whose entire subject is credentials — `.env` is
+// gitignored, but the failure mode it guards is a key pasted into a fixture, a
+// doc, or an example config, where the ignore rules do not reach. The
+// text-typed builtins skip binary fixtures on their own — but a MINIFIED bundle
+// is text, so the vendored asset needs naming explicitly:
+//
+// The `vendored` list below is scoped to the steps that can REWRITE a file,
+// which was checked against hk 1.55's own `--help`: `trailing-whitespace` and
+// `end-of-file-fixer` both advertise "check for and optionally fix", while
+// `check-merge-conflict` and `detect-private-key` have no fix mode at all.
+// A VENDORED bundle is byte-identical to the file its upstream publishes, and
+// upstream's copy ends on a `;` with no trailing newline, so appending or
+// trimming a byte is the one change that must never be made automatically.
+// The asset passes both mutating rules
+// TODAY, so this guards the next re-fetch, not a present failure.
+//
+// Report-only steps keep scanning it: a rule that cannot write cannot corrupt,
+// and a key pasted into an asset is exactly what the credential sweep exists
+// to find. Exempt from MUTATION, never from SCANNING.
+local vendored = List("**/assets/**")
+local hygiene = new Mapping<String, Step> {
+  ["trailing-whitespace"] = Builtins.trailing_whitespace {
+    exclude = vendored
+  }
+  ["end-of-file"] = Builtins.newlines {
+    exclude = vendored
+  }
+  ["check-merge-conflict"] = Builtins.check_merge_conflict
+  ["detect-private-key"] = Builtins.detect_private_key
+  ["actionlint"] = Builtins.actionlint
+}
+
+local cargo_gate = new Mapping<String, Step> {
+  // Builtins.cargo_fmt supplies the `**/*.rs` glob — a docs-only commit skips the
+  // Rust gate instead of waiting on a cold workspace — and the fix/check split that
+  // makes `fix = true` below reformat rather than merely report. Both commands are
+  // overridden because the builtin runs per manifest while a workspace-wide rule set
+  // must see all members at once: --all is what stops a crate that only fails
+  // against a sibling's change from landing green.
+  ["cargo-fmt"] = (Builtins.cargo_fmt) {
+    check = "cargo fmt --all -- --check"
+    fix = "cargo fmt --all"
+    // The builtin's default indicator is Cargo.toml, which every member has, so hk
+    // partitioned this step into one job per crate — measured 7 jobs, each re-running
+    // the same `cargo fmt --all`. Cargo.lock is root-only in a workspace (members
+    // share the root lockfile), so the partition collapses to a single root job.
+    // Setting the indicator to "" does not collapse it; the builtin value survives.
+    workspace_indicator = "Cargo.lock"
+    // Inherited per-manifest helpers, and `check_first`/fix mode consults them: they
+    // would reintroduce the sharding `--all` exists to avoid for output hk does not
+    // need, since cargo fmt prints its own diffs.
+    check_list_files = null
+    check_diff = null
+  }
+
+  ["cargo-clippy"] = (Builtins.cargo_clippy) {
+
+    check = "cargo clippy --locked --workspace --all-targets -- -D warnings"
+    // `fix` is deliberately the CHECK, not `--fix`, and this is the one line in the
+    // file that decides whether the hook is a gate at all. The pre-commit hook runs
+    // in fix mode, so a step whose `fix` is `clippy --fix` is the command that runs
+    // — and `--fix` exits 0 on any lint it cannot auto-apply. Verified here: dead
+    // code plus an unused variable, flagged by clippy on the same tree, committed
+    // green through that version of this step. Formatting is safe to auto-apply; a
+    // lint that needs a decision must be able to say no.
+    fix = "cargo clippy --locked --workspace --all-targets -- -D warnings"
+    workspace_indicator = "Cargo.lock"
+    check_list_files = null
+    check_diff = null
+    depends = "cargo-fmt"
+  }
+
+  // A plain Step, not a builtin: `hk builtins` lists cargo_check/cargo_clippy/
+  // cargo_fmt/cargo_deny and no test runner. It carries no workspace_indicator, so
+  // it is already one job over all matched files, and the command takes no file
+  // arguments (hk only injects paths where `{{files}}` appears). --all-targets is
+  // what makes examples and integration tests part of the gate, not just lib/bin.
+  // `--all-targets` intentionally excludes doctests: the hk/CI surface verifies
+  // every compiled test, example, and benchmark target, while the documented
+  // `cargo test --workspace` spelling remains available for a separate doctest run.
+
+  // Dependency policy is deliberately not a default hk step. `Builtins.cargo_deny`
+  // would require cargo-deny on every developer PATH, but the pinned hk toolchain
+  // does not provide it. gate.yml runs the cargo-deny Docker action once instead;
+  // forks wanting the same policy through hk must install cargo-deny themselves.
+
+  ["cargo-test"] = new Step {
+    glob = "**/*.rs"
+    check = "cargo test --locked --workspace --all-targets"
+    depends = "cargo-clippy"
+    // Assertion output goes to stdout, panics to stderr; the default summary keeps
+    // only stderr, which is the half that never explains the failure.
+    output_summary = "combined"
+  }
+}
+
+// The profile the hook never asks for, and the reason it is a separate Mapping
+// rather than a member of `cargo_gate`: any step in that Mapping is a step of the
+// `pre-commit` hook AND of `check`, so a fat-LTO release build in there would put
+// minutes on every commit — the exact trade the `cargo bench` note below refuses,
+// because a hook that takes minutes gets bypassed. This one runs only where it is
+// named: `hk run release -c` (check mode, no fixes, nothing to stage).
+//
+// What it exists to cover: the artifact any deploy ships is the `release` profile
+// — `lto = "fat"`, `codegen-units = 1`, `strip = true` — and nothing in the
+// workspace has ever COMPILED, let alone run the suite, in that profile. Debug
+// passes prove logic; they do not prove the optimizations that profile applies
+// agree with it, and the profile deliberately keeps unwinding (`panic = "abort"`
+// is refused because the panic->500 layer and `StreamOutcome`'s `panicked`
+// outcome depend on it), which is a codegen-sensitive property the release build
+// is the only place that can regress.
+local release_gate = new Mapping<String, Step> {
+  ["cargo-test-release"] = new Step {
+    glob = "**/*.rs"
+    // `--locked` for the same reason as the msrv job: a re-resolved graph is not
+    // the graph the deploy would build.
+    check = "cargo test --release --locked --workspace --all-targets"
+    // Identical to `check`, on the cargo-clippy precedent above: this hook is
+    // never in pre-commit, but `hk run release` WITHOUT `-c` runs fix mode, and a
+    // `new Step` with no `fix` leaves hk's default for that mode unverified — the
+    // same gamble `cargo-clippy`'s comment calls the one line that decides whether
+    // a hook is a gate at all. Duplicating the string is cheaper than trusting a
+    // default nobody read.
+    fix = "cargo test --release --locked --workspace --all-targets"
+    workspace_indicator = "Cargo.lock"
+    check_list_files = null
+    check_diff = null
+    output_summary = "combined"
+  }
+}
+
+// Opt-in dependency-policy group for forks that install cargo-deny themselves.
+// CI uses the official Docker action once so this hook does not add an unpinned
+// local prerequisite to the default mise-only toolchain or the pre-commit path.
+// A plain Step is required: the builtin partitions one invocation per manifest,
+// which repeats the same workspace check and trips wildcard path-dependency bans.
+local dependency_gate = new Mapping<String, Step> {
+  ["cargo-deny"] = new Step {
+    check = "cargo deny --locked --all-features check advisories licenses"
+    fix = "cargo deny --locked --all-features check advisories licenses"
+    output_summary = "combined"
+  }
+}
+
+// The autofixer, OUTSIDE the gate Mapping on purpose — and the reason is a hook
+// mechanic that is invisible from either file alone: `pre-commit` and `check`
+// take `cargo_gate` WHOLE, so any step added to that Mapping is a step in the
+// hook, and `fix = true` on the hook means the step's `fix` command is what
+// runs. A `clippy --fix` member would therefore (a) rewrite source during every
+// commit while `stage = true` folded those rewrites into the same commit, and
+// (b) race the gate: nothing orders it against `cargo-test`, which compiles and
+// tests the files it is editing, so one commit could pass and the next fail on
+// which cargo read the source first. Applying autofixes is the operator asking
+// for them; the only consumer is the `fix` hook below.
+local clippy_autofix = (Builtins.cargo_clippy) {
+    check = "cargo clippy --locked --workspace --all-targets -- -D warnings"
+    fix = "cargo clippy --locked --workspace --all-targets --fix --allow-dirty --allow-staged -- -D warnings"
+  workspace_indicator = "Cargo.lock"
+  check_list_files = null
+  check_diff = null
+}
+
+// Deliberately absent from every hook below: `cargo bench`. bench/benches/fold.rs is
+// criterion with `harness = false`, and a sampling run is minutes — a commit hook
+// that takes minutes gets bypassed with --no-verify, which is worse than no hook.
+// Under `cargo test` the same target runs in criterion's fast test mode (one tiny
+// pass), so a bench that no longer compiles is still caught by --all-targets; how
+// fast the fold is stays a `cargo bench` question for whoever edits it.
+// No post-commit hook either: once the commit is done nothing surfaces the result to
+// anyone, so a failing background gate would rot unheard.
+hooks {
+  // The git hook. `stash = "git"` parks unstaged work while the fix commands run and
+  // restores it afterwards — but when the gate REFUSES, that restoration is where an
+  // operator gets surprised: this session lost a half-finished `hk.pkl` edit to
+  // exactly that path, recovered later from `git stash list` (entries are named
+  // "hk"). Worth knowing before it reads as data loss: `git stash pop` returns it.
+  //
+  // Scope caveat, because the one autofix this hook does IS commit-affecting:
+  // `cargo fmt --all` is whole-workspace, so a commit staging one .rs file can
+  // reformat others and `stage = true` folds those in. That is the price of a
+  // workspace-wide formatter; for strict partial-commit behaviour flip to
+  // `stage = false` + `fail_on_fix = true`, which leaves the fix in the tree
+  // uncommitted and blocks the commit for review instead. Both values below are
+  // hk's defaults, written out so the escape hatch sits next to the trade-off.
+  // (The clippy autofixer is NOT here — see `clippy_autofix` above.)
+  ["pre-commit"] {
+    fix = true
+    stash = "git"
+    stage = true
+    fail_on_fix = false
+    steps {
+      ...hygiene
+      ...cargo_gate
+    }
+  }
+
+  // The deploy-shaped build: `hk run release -c --all`. Deliberately its own group
+  // rather than more steps in `check`, so the commit hook and the ordinary CI gate
+  // keep their current cost and this one is opt-in per job.
+  ["release"] {
+    steps {
+      ...release_gate
+    }
+  }
+
+  // `hk run deny -c --all` for a host that has installed cargo-deny. This invokes
+  // cargo-deny once at the workspace root with the same scope and locked input as CI.
+  ["deny"] {
+    steps {
+      ...dependency_gate
+    }
+  }
+
+  // `hk check [files|--all]` — the non-mutating form, and the CI mirror of this gate.
+  ["check"] {
+    steps {
+      ...hygiene
+      ...cargo_gate
+    }
+  }
+
+  // `hk fix` — the ONLY consumer of `clippy_autofix`, and the only hook here
+  // that rewrites source as anything other than formatting. Run it, don't
+  // assume a commit did it.
+  ["fix"] {
+    fix = true
+    steps {
+      ["cargo-fmt"] = cargo_gate["cargo-fmt"]
+      ["cargo-clippy-autofix"] = clippy_autofix
+    }
+  }
+}

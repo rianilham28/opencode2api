@@ -1,0 +1,38 @@
+{
+  "model": "gpt-5-mini",
+  "instructions": "Be brief.",
+  "input": [
+    {
+      "role": "user",
+      "content": [{ "type": "input_text", "text": "15% of 340?" }]
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_5o1dz",
+      "name": "calculator",
+      "arguments": "{\"expression\":\"340*0.15\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_5o1dz",
+      "output": "51"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "calculator",
+      "description": "Evaluate arithmetic.",
+      "parameters": {
+        "type": "object",
+        "properties": { "expression": { "type": "string" } },
+        "required": ["expression"]
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "max_output_tokens": 128,
+  "temperature": 0.3,
+  "reasoning": { "effort": "low" },
+  "stream": true
+}

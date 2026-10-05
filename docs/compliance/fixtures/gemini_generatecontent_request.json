@@ -1,0 +1,51 @@
+{
+  "contents": [
+    { "role": "user", "parts": [{ "text": "Weather in SF?" }] },
+    {
+      "role": "model",
+      "parts": [
+        {
+          "functionCall": {
+            "name": "get_weather",
+            "args": { "city": "SF" },
+            "id": "fc_71a"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "parts": [
+        {
+          "functionResponse": {
+            "name": "get_weather",
+            "id": "fc_71a",
+            "response": { "temp_c": 14, "sky": "fog" }
+          }
+        }
+      ]
+    }
+  ],
+  "systemInstruction": { "parts": [{ "text": "You are a terse weather bot." }] },
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "name": "get_weather",
+          "description": "Current conditions for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": { "city": { "type": "string" } },
+            "required": ["city"]
+          }
+        }
+      ]
+    }
+  ],
+  "generationConfig": {
+    "temperature": 0.2,
+    "maxOutputTokens": 128,
+    "stopSequences": ["END"]
+  },
+  "toolConfig": { "functionCallingConfig": { "mode": "AUTO" } }
+}

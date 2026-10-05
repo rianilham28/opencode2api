@@ -1,0 +1,40 @@
+# Tool pins, plus one version that must be kept in step with a second file.
+#
+# `rust` is pinned HERE on purpose even though `rust-toolchain.toml` also names a
+# channel, because the alternative was measured on the machine writing this: a
+# user-level mise config saying `rust = "latest"` outranks nothing in the repo,
+# its shim lands first on PATH, and `rust-toolchain.toml`'s 1.98.0 becomes a
+# comment — `rustc --version` reported 1.98.1 while the repo pinned 1.98.0.
+# Clippy lints are added between PATCH releases, so the gate can be green on one
+# and red on the other without anything looking wrong.
+#
+# Two places now name the toolchain, and they disagree loudly rather than
+# silently: mise provides the compiler, rust-toolchain.toml still owns the
+# COMPONENTS (rustfmt/clippy) and is what `rustup`-only machines (and any future
+# CI using dtolnay/rust-toolchain) will read. Changing one without the other shows
+# up as `mise install` fetching a version whose clippy disagrees with the lint
+# output — which is a start-up failure, not a quiet one.
+min_version = "2026.7.0"
+
+[tools]
+# Keep equal to `channel` in rust-toolchain.toml.
+rust = "1.98.0"
+# Keep equal to `min_hk_version` and the `package://` release in hk.pkl: a
+# floating hk binary would let a new release redefine a builtin default and
+# silently change what the gate accepts.
+hk = "1.55.0"
+# hk ships an `actionlint` builtin and the gate runs it over
+# `.github/workflows/*.yml`, so the binary is a dependency of the gate rather
+# than a decorative pin.
+actionlint = "1.7.12"
+
+[env]
+# hk's marker that it is driven through mise, so it resolves the pinned version
+# rather than whatever `hk` is first on PATH.
+HK_MISE = "1"
+
+[hooks]
+# Registering the hooks is what makes hk.pkl real: without it the file is
+# documentation and every commit stays ungated. Runs on `mise install` (or
+# `mise trust && mise install` on a fresh clone).
+postinstall = "hk install --mise"

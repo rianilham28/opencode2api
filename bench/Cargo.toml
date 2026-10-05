@@ -1,0 +1,38 @@
+[package]
+name = "x2api-bench"
+description = "Two instruments for the same proxy: an in-process comparative harness (throughput, pace, proxy-thread allocations) and criterion benches decomposing the per-frame fold (dev tool, not shipped with forks)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "x2api-bench"
+path = "src/main.rs"
+
+[dependencies]
+x2api-kit = { workspace = true }
+x2api-transport = { workspace = true }
+x2api-server = { workspace = true }
+x2api-dialects = { workspace = true }
+service = { path = "../crates/service" }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+memchr = { workspace = true }
+bytes = { workspace = true }
+mimalloc = { workspace = true }
+async-trait.workspace = true
+http.workspace = true
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+criterion = { version = "0.7.0", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "fold"
+harness = false

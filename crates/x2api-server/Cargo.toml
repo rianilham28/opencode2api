@@ -1,0 +1,36 @@
+[package]
+name = "x2api-server"
+description = "The generic HTTP surface of the x2api template: router, pipeline (auth gate, admission, retry), SSE relay, per-format error rendering, graceful drain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+x2api-kit = { workspace = true }
+x2api-dialects = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+memchr = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+async-stream = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+metrics-util = { version = "0.20.4", features = ["debugging"] }
+tracing-subscriber = { workspace = true }

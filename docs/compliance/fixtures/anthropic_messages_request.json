@@ -1,0 +1,41 @@
+{
+  "model": "claude-sonnet-4-6",
+  "max_tokens": 256,
+  "system": "Answer briefly.",
+  "temperature": 0.1,
+  "stream": true,
+  "messages": [
+    { "role": "user", "content": "What is 15% of 340?" },
+    {
+      "role": "assistant",
+      "content": [
+        { "type": "text", "text": "Let me compute." },
+        {
+          "type": "tool_use",
+          "id": "toolu_01A1B2",
+          "name": "calculator",
+          "input": { "expression": "340*0.15" }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        { "type": "tool_result", "tool_use_id": "toolu_01A1B2", "content": "51" }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "calculator",
+      "description": "Evaluate an arithmetic expression.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "expression": { "type": "string" } },
+        "required": ["expression"]
+      }
+    }
+  ],
+  "tool_choice": { "type": "auto" },
+  "metadata": { "user_id": "user-42" }
+}
