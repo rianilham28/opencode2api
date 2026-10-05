@@ -1,0 +1,87 @@
+# Tag-triggered GitHub Releases — the publisher gate.yml deliberately is not
+# (its `release` job verifies the shipping PROFILE; this workflow ships bytes).
+#
+# Push a `v*` tag: both legs build `target/release/x2api` with the profile that
+# actually ships (`lto = "fat"`, `codegen-units = 1`, `strip = true` — the
+# profile gate.yml already proves green on every push), package it with README
+# and LICENSE, checksum it, and attach everything to a GitHub Release named
+# after the tag. Tests are NOT re-run here: a tag is cut from a green main, and
+# `on.push` in gate.yml is unfiltered, so the tag push runs the full gate in
+# parallel — this file only publishes what that gate already proved.
+#
+# Two legs, chosen for what differs (the gate.yml `msrv` comment's own rule:
+# the axis is the BUILDER, not the distro): the linux build is glibc-linked
+# (portable across current distros, built on ubuntu-latest), the mac build is
+# Apple Silicon (macos-latest is arm64). Add windows only if someone runs this
+# binary there.
+#
+# `gh` (not a third-party release action) does the publishing, authenticated
+# with the built-in `github.token` — no PAT, nothing to rotate.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the release and upload its assets
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # never cancel a half-published release
+
+jobs:
+  publish:
+    strategy:
+      fail-fast: false # one leg failing must not orphan the other's assets
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45 # fat LTO on a cold cache is minutes, not hours
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup reads rust-toolchain.toml on the first cargo invocation and
+      # installs the pinned compiler itself; printing it makes a wrong-toolchain
+      # failure visible in the log rather than mysterious in the build.
+      - name: Show toolchain
+        run: rustup show active-toolchain && cargo --version
+
+      - name: Build the shipping profile
+        run: cargo build --release --locked -p service
+        # --locked: a tag must ship the graph Cargo.lock pins; a manifest edit
+        # that drifted the lock would build a graph nobody gate-verified.
+
+      - name: Package + checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="x2api-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/release/x2api "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -r "dist/$name"
+          # `shasum -a 256` exists on BOTH runners (sha256sum does not on macOS);
+          # the two-space separator is what `shasum -c` expects.
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # First leg creates the release from the pushed tag; the second leg
+          # races it and uploads instead — hence the create-else-upload pair
+          # rather than an ordering dependency between matrix legs.
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "$GITHUB_REF_NAME" --generate-notes \
+            dist/*.tar.gz dist/*.sha256 \
+          || gh release upload "$GITHUB_REF_NAME" --clobber \
+            dist/*.tar.gz dist/*.sha256
