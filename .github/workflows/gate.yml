@@ -105,7 +105,7 @@ jobs:
           test "$mise_hk" = "$pkl_hk"
           test "$mise_hk" = "$url_hk"
 
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
 
       # NOT optional insurance, and it is here because the first run of this
       # workflow failed with `'cargo-fmt' is not installed for the toolchain
@@ -219,7 +219,7 @@ jobs:
             arch: arm64
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.arch }}
@@ -302,7 +302,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
       # Fetch while the runner can reach registries: a cache miss still needs the
       # dependency sources, and the claim under test is that test execution—not setup—
       # uses only loopback mocks and succeeds with external network blocked.
@@ -328,7 +328,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
       - uses: Swatinem/rust-cache@v2
         with:
           key: bench
@@ -337,7 +337,7 @@ jobs:
         # Artifact and compile/run proof only: shared-runner deltas are noise, so
         # enforcing a latency threshold would produce false gates. No --baseline.
       - name: Upload benchmark baseline candidate
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-run-${{ github.sha }}
           path: run.json
