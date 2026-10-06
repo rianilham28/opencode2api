@@ -1,7 +1,7 @@
 # Tag-triggered GitHub Releases — the publisher gate.yml deliberately is not
 # (its `release` job verifies the shipping PROFILE; this workflow ships bytes).
 #
-# Push a `v*` tag: both legs build `target/release/x2api` with the profile that
+# Push a `v*` tag: both legs build `target/release/opencode2api` with the profile that
 # actually ships (`lto = "fat"`, `codegen-units = 1`, `strip = true` — the
 # profile gate.yml already proves green on every push), package it with README
 # and LICENSE, checksum it, and attach everything to a GitHub Release named
@@ -45,7 +45,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45 # fat LTO on a cold cache is minutes, not hours
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # rustup reads rust-toolchain.toml on the first cargo invocation and
       # installs the pinned compiler itself; printing it makes a wrong-toolchain
@@ -62,9 +62,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          name="x2api-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="opencode2api-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp target/release/x2api "dist/$name/"
+          cp target/release/opencode2api "dist/$name/"
           cp README.md LICENSE "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           rm -r "dist/$name"

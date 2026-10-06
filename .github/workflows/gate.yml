@@ -52,7 +52,7 @@ jobs:
     steps:
       # Node24-runtime release pinned by SHA; the `changes` job is this job's
       # prerequisite, so a job that cannot start also silences every gated job.
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Classify the push
@@ -81,7 +81,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         # `hk check --pr` resolves the diff against a base ref; a depth-1 clone
         # cannot. `--all` is what runs here (see the step below), but keeping the
         # history means the same config works for a PR-scoped run if that is ever
@@ -105,7 +105,7 @@ jobs:
           test "$mise_hk" = "$pkl_hk"
           test "$mise_hk" = "$url_hk"
 
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v5
 
       # NOT optional insurance, and it is here because the first run of this
       # workflow failed with `'cargo-fmt' is not installed for the toolchain
@@ -147,7 +147,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Resolve the declared floor
         id: floor
@@ -182,7 +182,7 @@ jobs:
           rustup run "${{ steps.floor.outputs.toolchain }}" cargo check --locked --workspace --all-targets
 
   # The profile that actually ships. Bring-up step 2 installs
-  # `target/release/x2api`, built with `lto = "fat"`, `codegen-units = 1`,
+  # `target/release/opencode2api`, built with `lto = "fat"`, `codegen-units = 1`,
   # `strip = true` — and deliberately WITHOUT `panic = "abort"`, because the
   # panic->500 layer and `StreamOutcome`'s `panicked` outcome depend on unwinding.
   # Until this job existed nothing in the repository had ever compiled that
@@ -218,8 +218,8 @@ jobs:
           - runner: ubuntu-24.04-arm
             arch: arm64
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.arch }}
@@ -238,7 +238,7 @@ jobs:
   # (setup-qemu below). Measured by hand before being written:
   # - fedora:43 ships NO `systemd-analyze` — the parser is installed;
   # - the verifier RESOLVES `ExecStart`: with no binary at that path it exits 1 on
-  #   "Command /usr/local/bin/x2api is not executable", so the stub is load-bearing;
+  #   "Command /usr/local/bin/opencode2api is not executable", so the stub is load-bearing;
   # - with the stub, the unit verifies with empty output on amd64, and the arm64 leg
   #   was proven the same way locally (native arm on Apple Silicon) before landing.
   # The predicate fails on non-zero rc (proven by the missing-stub case) AND on
@@ -249,7 +249,7 @@ jobs:
   # `fedora:43` stays a FLOATING tag on purpose: the parser's version is the thing
   # under test, and digest-pinning would freeze a stale systemd and silence exactly
   # the regression this job exists to catch. `:43` floats patches, not the major.
-  # The pinned `User=x2api` needs no account created (verified).
+  # The pinned `User=opencode2api` needs no account created (verified).
   #
   # Both legs must be allowed to finish independently: the point of two
   # architectures is LEARNING whether a parse note is arch-specific, and fail-fast
@@ -263,7 +263,7 @@ jobs:
       matrix:
         platform: [linux/amd64, linux/arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run the parser in fedora:43
         run: |
           if [ "${{ matrix.platform }}" = "linux/arm64" ]; then
@@ -277,12 +277,12 @@ jobs:
             set -eu
             dnf -q -y install systemd
             mkdir -p /usr/local/bin
-            for b in x2api; do
+            for b in opencode2api; do
               printf "#!/bin/sh\n" > "/usr/local/bin/$b"
               chmod +x "/usr/local/bin/$b"
             done
             cd /d
-            for u in x2api; do
+            for u in opencode2api; do
               if ! out=$(systemd-analyze verify "$u.service" 2>&1); then
                 printf "::error::%s.service failed to verify (on %s):\n%s\n" "$u" "$1" "$out"
                 exit 1
@@ -301,8 +301,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
       # Fetch while the runner can reach registries: a cache miss still needs the
       # dependency sources, and the claim under test is that test execution—not setup—
       # uses only loopback mocks and succeeds with external network blocked.
@@ -327,17 +327,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
       - uses: Swatinem/rust-cache@v2
         with:
           key: bench
       - name: Compile and run the benchmark
-        run: mise exec -- cargo run --release --locked -p x2api-bench -- --json > run.json
+        run: mise exec -- cargo run --release --locked -p opencode2api-bench -- --json > run.json
         # Artifact and compile/run proof only: shared-runner deltas are noise, so
         # enforcing a latency threshold would produce false gates. No --baseline.
       - name: Upload benchmark baseline candidate
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-run-${{ github.sha }}
           path: run.json
