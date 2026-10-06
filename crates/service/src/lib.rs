@@ -6,7 +6,7 @@
 //! implementation — a starting point, not a fixture.
 //!
 //! That is why nothing here is named after a vendor. The crate is `service`,
-//! the binary is `x2api` (rename it to whatever you deploy as; nothing
+//! the binary is `opencode2api` (rename it to whatever you deploy as; nothing
 //! depends on it), and pointing this at a different upstream is a diff to one
 //! file rather than a copy-and-rename of a crate.
 //!
@@ -41,7 +41,7 @@ pub struct ServiceConfig {
     /// provider log/metric dimensions; it does not select request behavior.
     #[serde(default = "default_provider_name")]
     pub name: String,
-    /// Serde-defaulted ONLY so the documented `X2API_UPSTREAM_URL` env
+    /// Serde-defaulted ONLY so the documented `OPENCODE2API_UPSTREAM_URL` env
     /// override gets a chance to supply it: the real gate is the `ensure!`
     /// in `from_doc`, which runs after the environment is read. Without
     /// this the parse died first and the env-only quick start the files
@@ -51,9 +51,9 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub api_key: Option<String>,
     /// More than one upstream credential. ADDITIVE, not exclusive: `api_key`
-    /// becomes slot 0, so an operator who already has `X2API_UPSTREAM_KEY` in
+    /// becomes slot 0, so an operator who already has `OPENCODE2API_UPSTREAM_KEY` in
     /// `.env` adds a second account by listing it here (or in
-    /// `X2API_UPSTREAM_KEYS`) without rewriting what works. The rotation policy
+    /// `OPENCODE2API_UPSTREAM_KEYS`) without rewriting what works. The rotation policy
     /// — which vendor answer means "this credential is spent" — is code in
     /// `provider.rs`, because that is a vendor fact and `ServiceConfig` is
     /// documented to hold only secrets and endpoints.
@@ -69,7 +69,7 @@ pub struct ServiceConfig {
     /// may return in a single buffered reply (streams are bounded by the
     /// request deadline, not by size). This is a resource ceiling, not a
     /// behavioural knob, so it may live here. Default:
-    /// `x2api_kit::provider::DEFAULT_MAX_RESPONSE_BYTES`.
+    /// `opencode2api_kit::provider::DEFAULT_MAX_RESPONSE_BYTES`.
     #[serde(default)]
     pub max_response_bytes: Option<u64>,
 }
@@ -86,13 +86,13 @@ impl ServiceConfig {
             .unwrap_or_else(|| Value::Object(Default::default()));
         let mut cfg: ServiceConfig = serde_json::from_value(section)
             .map_err(|e| anyhow::anyhow!("provider section: {e}"))?;
-        if let Ok(v) = std::env::var(x2api_kit::config::ENV_UPSTREAM_URL) {
+        if let Ok(v) = std::env::var(opencode2api_kit::config::ENV_UPSTREAM_URL) {
             cfg.base_url = v;
         }
-        if let Ok(v) = std::env::var(x2api_kit::config::ENV_UPSTREAM_KEY) {
+        if let Ok(v) = std::env::var(opencode2api_kit::config::ENV_UPSTREAM_KEY) {
             cfg.api_key = Some(v);
         }
-        if let Ok(v) = std::env::var(x2api_kit::config::ENV_UPSTREAM_KEYS) {
+        if let Ok(v) = std::env::var(opencode2api_kit::config::ENV_UPSTREAM_KEYS) {
             cfg.api_keys.extend(
                 v.split(',')
                     .map(str::trim)
@@ -103,7 +103,7 @@ impl ServiceConfig {
         anyhow::ensure!(
             !cfg.base_url.is_empty(),
             "provider.base_url is required — set provider.base_url in the \
-             config file or X2API_UPSTREAM_URL in the environment"
+             config file or OPENCODE2API_UPSTREAM_URL in the environment"
         );
         cfg.base_url = cfg.base_url.trim_end_matches('/').to_string();
         Ok(cfg)
@@ -132,6 +132,6 @@ impl ServiceConfig {
     pub fn response_ceiling(&self) -> usize {
         self.max_response_bytes
             .and_then(|b| usize::try_from(b).ok())
-            .unwrap_or(x2api_kit::provider::DEFAULT_MAX_RESPONSE_BYTES)
+            .unwrap_or(opencode2api_kit::provider::DEFAULT_MAX_RESPONSE_BYTES)
     }
 }

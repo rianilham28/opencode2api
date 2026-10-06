@@ -1,4 +1,4 @@
-//! x2api-bench — comparative throughput AND pace, not a load test.
+//! opencode2api-bench — comparative throughput AND pace, not a load test.
 //!
 //! One mock upstream streams OpenAI-shape SSE; the SAME proxy (real router,
 //! real relay, real reqwest/hyper over loopback TCP) is driven in its three
@@ -29,7 +29,7 @@
 //! Read the timings as comparative ON THIS MACHINE (release build, mimalloc
 //! like the shipped bins); they are not SLO figures.
 //!
-//!   cargo run --release -p x2api-bench -- [--frames N] [--responses N]
+//!   cargo run --release -p opencode2api-bench -- [--frames N] [--responses N]
 //!       [--repeats N] [-c N] [--pace] [--pace-us N] [--json]
 //!
 //! `--pace` makes the mock write one frame per `write` (what a real upstream
@@ -230,7 +230,7 @@ impl Args {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "x2api-bench [--frames N] [--responses N] [--repeats N] [-c N]\n\
+                        "opencode2api-bench [--frames N] [--responses N] [--repeats N] [-c N]\n\
                          \x20 [--pace] [--pace-us N] [--proxy-threads N] [--buffered]\n\
                          \x20 [--payload ascii|unicode|tools] [--json]\n\
                          \x20 [--proxy-connect-ms N] [--lane-cold]\n\
@@ -627,21 +627,21 @@ struct NativeChat {
 }
 
 #[async_trait::async_trait]
-impl x2api_kit::Provider for NativeChat {
+impl opencode2api_kit::Provider for NativeChat {
     fn name(&self) -> &'static str {
         "native-chat"
     }
 
-    fn native_dialects(&self) -> &'static [x2api_kit::Dialect] {
-        &[x2api_kit::Dialect::Chat]
+    fn native_dialects(&self) -> &'static [opencode2api_kit::Dialect] {
+        &[opencode2api_kit::Dialect::Chat]
     }
 
     async fn relay_raw(
         &self,
-        _dialect: x2api_kit::Dialect,
+        _dialect: opencode2api_kit::Dialect,
         client_body: bytes::Bytes,
-        _ctx: &x2api_kit::CallContext<'_>,
-    ) -> Result<x2api_kit::RawReply, x2api_kit::ProviderError> {
+        _ctx: &opencode2api_kit::CallContext<'_>,
+    ) -> Result<opencode2api_kit::RawReply, opencode2api_kit::ProviderError> {
         let resp = self
             .client
             .post(self.url.clone())
@@ -649,22 +649,22 @@ impl x2api_kit::Provider for NativeChat {
             .body(client_body)
             .send()
             .await
-            .map_err(x2api_kit::ProviderError::from)?;
+            .map_err(opencode2api_kit::ProviderError::from)?;
         let status = resp.status().as_u16();
         let content_type = resp.headers().get(http::header::CONTENT_TYPE).cloned();
-        let wrapped = x2api_kit::UpstreamResponse(resp);
+        let wrapped = opencode2api_kit::UpstreamResponse(resp);
         let frames = if wrapped.is_sse() {
-            x2api_kit::RawFrames::Sse(wrapped.into_chunks())
+            opencode2api_kit::RawFrames::Sse(wrapped.into_chunks())
         } else {
-            x2api_kit::RawFrames::Buffered(
+            opencode2api_kit::RawFrames::Buffered(
                 wrapped
                     .into_response()
                     .bytes()
                     .await
-                    .map_err(x2api_kit::ProviderError::from)?,
+                    .map_err(opencode2api_kit::ProviderError::from)?,
             )
         };
-        Ok(x2api_kit::RawReply {
+        Ok(opencode2api_kit::RawReply {
             status,
             content_type,
             headers: Default::default(),
@@ -674,17 +674,17 @@ impl x2api_kit::Provider for NativeChat {
 
     async fn complete(
         &self,
-        req: &x2api_kit::ChatRequest,
-        ctx: &x2api_kit::CallContext<'_>,
-    ) -> Result<x2api_kit::Completion, x2api_kit::ProviderError> {
+        req: &opencode2api_kit::ChatRequest,
+        ctx: &opencode2api_kit::CallContext<'_>,
+    ) -> Result<opencode2api_kit::Completion, opencode2api_kit::ProviderError> {
         self.inner.complete(req, ctx).await
     }
 
     async fn stream(
         &self,
-        req: &x2api_kit::ChatRequest,
-        ctx: &x2api_kit::CallContext<'_>,
-    ) -> Result<x2api_kit::ChatStream, x2api_kit::ProviderError> {
+        req: &opencode2api_kit::ChatRequest,
+        ctx: &opencode2api_kit::CallContext<'_>,
+    ) -> Result<opencode2api_kit::ChatStream, opencode2api_kit::ProviderError> {
         self.inner.stream(req, ctx).await
     }
 }
@@ -728,7 +728,7 @@ fn proxy_on(
     std_listener.set_nonblocking(true)?;
     let addr = std_listener.local_addr()?;
     rt.spawn(async move {
-        let mut server = x2api_kit::ServerConfig {
+        let mut server = opencode2api_kit::ServerConfig {
             bind: "127.0.0.1".into(),
             port: 0,
             sse_keepalive_secs: 0,
@@ -749,10 +749,10 @@ fn proxy_on(
             max_response_bytes: None,
         };
         let (transport, lane_probe) = match egress {
-            Egress::Direct => (x2api_transport::Transport::direct(&server), None),
+            Egress::Direct => (opencode2api_transport::Transport::direct(&server), None),
             Egress::Lane { proxy, prewarm } => {
-                let cfg = x2api_transport::ProxyConfig {
-                    vendors: vec![x2api_transport::ProxyVendorConfig {
+                let cfg = opencode2api_transport::ProxyConfig {
+                    vendors: vec![opencode2api_transport::ProxyVendorConfig {
                         name: "bench".into(),
                         // A session template, so the lane exercises the real
                         // minting path rather than a fixed URL.
@@ -767,7 +767,7 @@ fn proxy_on(
                     prewarm,
                     ..Default::default()
                 };
-                let t = x2api_transport::Transport::with_proxy(&server, &cfg)
+                let t = opencode2api_transport::Transport::with_proxy(&server, &cfg)
                     .expect("bench lane config is valid");
                 (t, Some(format!("http://{mock}/v1/models")))
             }
@@ -778,7 +778,7 @@ fn proxy_on(
         let transport_for_start = transport.clone();
         let inner =
             service::OpenAiProvider::new(transport, provider).expect("bench base_url parses");
-        let provider: Arc<dyn x2api_kit::Provider> = if native {
+        let provider: Arc<dyn opencode2api_kit::Provider> = if native {
             Arc::new(NativeChat {
                 inner,
                 client: native_client.expect("native client was obtained above"),
@@ -791,12 +791,18 @@ fn proxy_on(
             // Warm (or deliberately do not warm) before anything serves.
             transport_for_start.start(Some(probe)).await;
         }
-        let pipeline = x2api_server::Pipeline::new(provider, Arc::new(server), None);
+        let pipeline = opencode2api_server::Pipeline::new(provider, Arc::new(server), None);
         let listener = TcpListener::from_std(std_listener).unwrap();
         // serve() watches this sender; never flip it — the bench exits with
         // the process, exactly like the bins it mirrors.
         let (tx, _rx) = watch::channel(false);
-        let _ = x2api_server::serve(listener, x2api_server::build_router(pipeline), 1, tx).await;
+        let _ = opencode2api_server::serve(
+            listener,
+            opencode2api_server::build_router(pipeline),
+            1,
+            tx,
+        )
+        .await;
     });
     // Let the listener accept before the first timed request.
     std::thread::sleep(Duration::from_millis(50));
@@ -1058,7 +1064,7 @@ fn contains(hay: &[u8], needle: &str) -> bool {
 
 fn print_table(rows: &[Run], args: &Args, failed: bool) {
     println!(
-        "x2api-bench — mode={} payload={} frames/resp={} responses={} repeats={} \
+        "opencode2api-bench — mode={} payload={} frames/resp={} responses={} repeats={} \
          concurrency={:?} mock={} proxy-threads={}  {}",
         if args.buffered {
             "buffered"
@@ -1649,7 +1655,7 @@ mod tests {
         fn new(doc: serde_json::Value) -> Self {
             let id = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "x2api-bench-baseline-{}-{}.json",
+                "opencode2api-bench-baseline-{}-{}.json",
                 std::process::id(),
                 id
             ));

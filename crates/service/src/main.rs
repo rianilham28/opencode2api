@@ -1,17 +1,17 @@
 use clap::Parser;
+use opencode2api_kit::{ServerConfig, telemetry};
+use opencode2api_server::Pipeline;
+use opencode2api_transport::{ProxyConfig, build};
 use service::{OpenAiProvider, ServiceConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
-use x2api_kit::{ServerConfig, telemetry};
-use x2api_server::Pipeline;
-use x2api_transport::{ProxyConfig, build};
 
-/// Example x2api service: OpenAI-dialect provider (the copy-me bin).
+/// Example opencode2api service: OpenAI-dialect provider (the copy-me bin).
 #[derive(Parser, Debug)]
 #[command(name = "service", version, about)]
 struct Args {
     /// JSON config file (see config.example.json).
-    #[arg(short, long, env = x2api_kit::ENV_CONFIG)]
+    #[arg(short, long, env = opencode2api_kit::ENV_CONFIG)]
     config: Option<PathBuf>,
 }
 
@@ -22,7 +22,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 async fn main() -> anyhow::Result<()> {
     // Before anything reads the environment: `.env` fills in what the shell
     // did not export, and never overrides what it did.
-    let env_file = x2api_kit::load_dotenv()?;
+    let env_file = opencode2api_kit::load_dotenv()?;
     let args = Args::parse();
     let (server_cfg, doc) = ServerConfig::load(args.config.as_deref())?;
     let provider_cfg = ServiceConfig::from_doc(&doc)?;
@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(handle) => {
             // Transport owns the egress family; the composition root installs
             // its descriptions only after a recorder actually owns the data.
-            x2api_transport::describe_metrics();
+            opencode2api_transport::describe_metrics();
             Some(handle)
         }
         Err(e) => {
@@ -60,5 +60,5 @@ async fn main() -> anyhow::Result<()> {
         .start(Some(provider.probe_url().to_string()))
         .await;
     let pipeline = Pipeline::new(provider, Arc::new(server_cfg), metrics);
-    x2api_server::run(pipeline).await
+    opencode2api_server::run(pipeline).await
 }

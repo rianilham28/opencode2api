@@ -23,11 +23,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use x2api_kit::{
+use opencode2api_kit::{
     CallContext, ChatChunk, ChatRequest, ChatStream, ChunkStream, Completion, Provider,
     ProviderError, ToolCall, ToolCallDelta, UpstreamResponse, Usage, pool::CooldownReason,
 };
-use x2api_transport::{Lane, Transport};
+use opencode2api_transport::{Lane, Transport};
 
 use crate::ServiceConfig;
 
@@ -256,8 +256,8 @@ impl DoneTrim {
 /// Fed the TRIMMED bytes — what the client actually receives — so the lane's
 /// verdict describes the stream the client saw.
 fn observe_terminal(
-    decoder: &mut x2api_kit::sse::SseDecoder,
-    events: &mut Vec<x2api_kit::sse::SseEvent>,
+    decoder: &mut opencode2api_kit::sse::SseDecoder,
+    events: &mut Vec<opencode2api_kit::sse::SseEvent>,
     bytes: &[u8],
     touch: &mut TouchOnDrop,
 ) {
@@ -284,7 +284,7 @@ fn touch_when_stream_ends(
     let mut upstream = resp.into_chunks();
     stream! {
         let mut trim = DoneTrim::new();
-        let mut terminal = x2api_kit::sse::SseDecoder::with_max_record(max);
+        let mut terminal = opencode2api_kit::sse::SseDecoder::with_max_record(max);
         let mut events = Vec::new();
         while let Some(chunk) = upstream.next().await {
             match chunk {
@@ -625,10 +625,10 @@ pub struct OpenAiProvider {
     /// than per call — see `OpenCodeProfile`.
     opencode: OpenCodeProfile,
     /// Upstream credentials, in slot order. The POOL holds indices, never keys
-    /// (`x2api_kit::pool`), so the thing that gets logged or Debug-formatted
+    /// (`opencode2api_kit::pool`), so the thing that gets logged or Debug-formatted
     /// cannot carry a credential.
     keys: Vec<String>,
-    pool: x2api_kit::pool::Pool,
+    pool: opencode2api_kit::pool::Pool,
     /// Vendor models upstream answered dead, mapped to when the quiet
     /// window ends. Catalogue-side ONLY: the request path never reads it,
     /// the 400 still reaches the client verbatim, and a repeat answer
@@ -733,13 +733,13 @@ impl OpenAiProvider {
             self.decorate(req, None, ctx)?
         };
         let resp = req.send().await.map_err(|e| {
-            match x2api_transport::classify_send(&e) {
-                x2api_transport::SendFault::Lane => lane.note_failure(),
-                x2api_transport::SendFault::Slow => {
+            match opencode2api_transport::classify_send(&e) {
+                opencode2api_transport::SendFault::Lane => lane.note_failure(),
+                opencode2api_transport::SendFault::Slow => {
                     lane.note_slow();
                     lane.note_used();
                 }
-                x2api_transport::SendFault::Other => {}
+                opencode2api_transport::SendFault::Other => {}
             }
             ProviderError::from(e)
         })?;
@@ -750,13 +750,14 @@ impl OpenAiProvider {
         if resp.status() == http::StatusCode::UPGRADE_REQUIRED {
             announce_version_floor().await;
         }
-        let resp = x2api_kit::errors::gate_response(&self.cfg.name, Some(ctx.request_id), resp)
-            .await
-            .map_err(|error| match hint {
-                Some(secs) => error.with_retry_after(secs.min(Self::MAX_COOLDOWN_SECS)),
-                None => error,
-            })
-            .inspect_err(|e| self.note_credential(slot, e))?;
+        let resp =
+            opencode2api_kit::errors::gate_response(&self.cfg.name, Some(ctx.request_id), resp)
+                .await
+                .map_err(|error| match hint {
+                    Some(secs) => error.with_retry_after(secs.min(Self::MAX_COOLDOWN_SECS)),
+                    None => error,
+                })
+                .inspect_err(|e| self.note_credential(slot, e))?;
         let bytes = UpstreamResponse(resp)
             .body_bytes_capped(self.cfg.response_ceiling())
             .await?;
@@ -816,7 +817,7 @@ impl OpenAiProvider {
             // path instead of a special case that only the second key ever
             // exercised. Zero slots is the passthrough mode, where the pool is
             // never consulted.
-            pool: x2api_kit::pool::Pool::new(keys.len()),
+            pool: opencode2api_kit::pool::Pool::new(keys.len()),
             keys,
             reverse_model_map: Arc::new(reverse_model_map),
             unavailable: Mutex::new(HashMap::new()),
@@ -1166,13 +1167,13 @@ impl OpenAiProvider {
             // tell a dead tunnel from a slow generation, and three slow
             // generations must not retire three healthy exit IPs.
             Err(e) => {
-                match x2api_transport::classify_send(&e) {
-                    x2api_transport::SendFault::Lane => touch.transport_error(),
+                match opencode2api_transport::classify_send(&e) {
+                    opencode2api_transport::SendFault::Lane => touch.transport_error(),
                     // Counted and labelled, never charged: the guard drops
                     // into `note_used`, which touches the lane's clock without
                     // clearing or advancing its health verdict.
-                    x2api_transport::SendFault::Slow => touch.lane.note_slow(),
-                    x2api_transport::SendFault::Other => {}
+                    opencode2api_transport::SendFault::Slow => touch.lane.note_slow(),
+                    opencode2api_transport::SendFault::Other => {}
                 }
                 return Err(ProviderError::from(e));
             }
@@ -1192,36 +1193,37 @@ impl OpenAiProvider {
             // still fails).
             announce_version_floor().await;
         }
-        let gated = x2api_kit::errors::gate_response(&self.cfg.name, Some(ctx.request_id), resp)
-            .await
-            .map_err(|mut e| {
-                // One value, two consumers: the pool's cooldown below reads
-                // `err.retry_after`, and the same field is what `render` turns
-                // into the client's `Retry-After`. Deliberately not two numbers --
-                // a client told to wait 5 s while the proxy parks the key for 120
-                // would retry into a slot we know is shut, and both sides of the
-                // claim would be unverifiable from the other.
-                if let Some(secs) = hint {
-                    e = e.with_retry_after(secs.min(Self::MAX_COOLDOWN_SECS));
-                }
-                e
-            })
-            .inspect_err(|e| self.note_credential(slot, e))
-            // Chain off the credential note, not a new branch: gate
-            // classification, retryability, and lane accounting above stay
-            // untouched. The model is the one the body already rewrote
-            // through model_map — the vendor's id, which is what the
-            // catalogue lists — and only RECORDS here; this 400 still
-            // reaches the client verbatim.
-            .inspect_err(|e| {
-                if let Some(model) = body.get("model").and_then(Value::as_str) {
-                    let mut suppressed = self
-                        .unavailable
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    note_unavailable_model(&mut suppressed, e, model, Instant::now());
-                }
-            });
+        let gated =
+            opencode2api_kit::errors::gate_response(&self.cfg.name, Some(ctx.request_id), resp)
+                .await
+                .map_err(|mut e| {
+                    // One value, two consumers: the pool's cooldown below reads
+                    // `err.retry_after`, and the same field is what `render` turns
+                    // into the client's `Retry-After`. Deliberately not two numbers --
+                    // a client told to wait 5 s while the proxy parks the key for 120
+                    // would retry into a slot we know is shut, and both sides of the
+                    // claim would be unverifiable from the other.
+                    if let Some(secs) = hint {
+                        e = e.with_retry_after(secs.min(Self::MAX_COOLDOWN_SECS));
+                    }
+                    e
+                })
+                .inspect_err(|e| self.note_credential(slot, e))
+                // Chain off the credential note, not a new branch: gate
+                // classification, retryability, and lane accounting above stay
+                // untouched. The model is the one the body already rewrote
+                // through model_map — the vendor's id, which is what the
+                // catalogue lists — and only RECORDS here; this 400 still
+                // reaches the client verbatim.
+                .inspect_err(|e| {
+                    if let Some(model) = body.get("model").and_then(Value::as_str) {
+                        let mut suppressed = self
+                            .unavailable
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        note_unavailable_model(&mut suppressed, e, model, Instant::now());
+                    }
+                });
         match gated {
             Ok(resp) => Ok((UpstreamResponse(resp), touch)),
             Err(error) => {
@@ -1660,12 +1662,12 @@ impl Provider for OpenAiProvider {
         let framed = ir
             .map_ok(|c| {
                 let mut buf = bytes::BytesMut::with_capacity(256);
-                x2api_dialects::chat::append_chunk_frame(&c, &mut buf);
+                opencode2api_dialects::chat::append_chunk_frame(&c, &mut buf);
                 buf.freeze()
             })
             .map_err(|e| e.to_string())
             .chain(futures_util::stream::iter(vec![Ok(
-                bytes::Bytes::from_static(x2api_kit::sse::DONE_FRAME),
+                bytes::Bytes::from_static(opencode2api_kit::sse::DONE_FRAME),
             )]));
         Ok(framed.boxed())
     }
@@ -1778,7 +1780,7 @@ async fn to_ir_stream(
         restore_requested_model(&mut completion.model, restore.as_ref());
         touch.complete();
         return Ok(futures_util::stream::iter(
-            x2api_kit::types::completion_to_chunks(&completion)
+            opencode2api_kit::types::completion_to_chunks(&completion)
                 .into_iter()
                 .map(Ok),
         )
@@ -1811,7 +1813,7 @@ async fn to_ir_stream_responses(
         restore_requested_model(&mut completion.model, restore.as_ref());
         touch.complete();
         return Ok(futures_util::stream::iter(
-            x2api_kit::types::completion_to_chunks(&completion)
+            opencode2api_kit::types::completion_to_chunks(&completion)
                 .into_iter()
                 .map(Ok),
         )
@@ -1934,7 +1936,7 @@ fn completion_from_responses(
         id: value
             .get("id")
             .and_then(Value::as_str)
-            .unwrap_or("x2api-completion")
+            .unwrap_or("opencode2api-completion")
             .to_string(),
         model: value
             .get("model")
@@ -2201,9 +2203,9 @@ fn decode_responses_sse(
 ) -> impl futures_util::Stream<Item = Result<ChatChunk, ProviderError>> + Send + 'static {
     // Owned before the generator captures it: the returned stream is 'static.
     let model_fallback = model_fallback.to_string();
-    let mut decoder = x2api_kit::sse::SseDecoder::with_max_record(max_record);
+    let mut decoder = opencode2api_kit::sse::SseDecoder::with_max_record(max_record);
     try_stream! {
-        use x2api_kit::sse::SseEvent;
+        use opencode2api_kit::sse::SseEvent;
         // One events Vec for the whole stream; the decoder drains into it.
         let mut events: Vec<SseEvent> = Vec::new();
         let mut saw_arguments: HashSet<u32> = HashSet::new();
@@ -2283,9 +2285,9 @@ fn decode_upstream_sse(
     restore: Option<ModelRestore>,
     mut touch: TouchOnDrop,
 ) -> impl futures_util::Stream<Item = Result<ChatChunk, ProviderError>> + Send + 'static {
-    let mut decoder = x2api_kit::sse::SseDecoder::with_max_record(max_record);
+    let mut decoder = opencode2api_kit::sse::SseDecoder::with_max_record(max_record);
     try_stream! {
-        use x2api_kit::sse::SseEvent;
+        use opencode2api_kit::sse::SseEvent;
         // One events Vec for the whole stream; the decoder drains into it.
         let mut events: Vec<SseEvent> = Vec::new();
         while let Some(chunk) = upstream.next().await {
@@ -2348,7 +2350,7 @@ mod tests {
     use super::*;
     #[test]
     fn shared_sse_decoder_recognizes_coalesced_split_and_suffix_done() {
-        use x2api_kit::sse::{SseDecoder, SseEvent};
+        use opencode2api_kit::sse::{SseDecoder, SseEvent};
         let done = |parts: &[&[u8]]| {
             let mut decoder = SseDecoder::new();
             let mut events = Vec::new();
@@ -2368,7 +2370,8 @@ mod tests {
 
     #[test]
     fn local_body_verdicts_are_not_lane_transport_errors() {
-        let transport = x2api_transport::Transport::direct(&x2api_kit::ServerConfig::default());
+        let transport =
+            opencode2api_transport::Transport::direct(&opencode2api_kit::ServerConfig::default());
         let guard = TouchOnDrop {
             lane: transport.lane().unwrap(),
             completed: false,
@@ -2380,7 +2383,7 @@ mod tests {
     /// A provider over N configured credentials, for the pool tests.
     fn pooled(keys: &[&str]) -> OpenAiProvider {
         OpenAiProvider::new(
-            x2api_transport::Transport::direct(&x2api_kit::ServerConfig::default()),
+            opencode2api_transport::Transport::direct(&opencode2api_kit::ServerConfig::default()),
             ServiceConfig {
                 name: "openai".into(),
                 base_url: "https://api.openai.com".into(),
@@ -2394,7 +2397,7 @@ mod tests {
     }
     fn model_mapped_provider(pairs: &[(&str, &str)]) -> anyhow::Result<OpenAiProvider> {
         OpenAiProvider::new(
-            x2api_transport::Transport::direct(&x2api_kit::ServerConfig::default()),
+            opencode2api_transport::Transport::direct(&opencode2api_kit::ServerConfig::default()),
             ServiceConfig {
                 name: "openai".into(),
                 base_url: "https://api.openai.com".into(),
@@ -2538,7 +2541,7 @@ mod tests {
 
         let mut counts = std::collections::BTreeMap::new();
         for (key, _, _, value) in snapshotter.snapshot().into_vec() {
-            if key.key().name() != x2api_kit::telemetry::names::CREDENTIAL_COOLDOWNS {
+            if key.key().name() != opencode2api_kit::telemetry::names::CREDENTIAL_COOLDOWNS {
                 continue;
             }
             let DebugValue::Counter(c) = value else {
@@ -2691,7 +2694,7 @@ mod tests {
 
     fn provider(base: &str) -> OpenAiProvider {
         OpenAiProvider::new(
-            x2api_transport::Transport::direct(&x2api_kit::ServerConfig::default()),
+            opencode2api_transport::Transport::direct(&opencode2api_kit::ServerConfig::default()),
             ServiceConfig {
                 name: "openai".into(),
                 base_url: base.to_string(),
@@ -2738,7 +2741,9 @@ mod tests {
         // A base that cannot form a URL is a boot failure, not a 500 per call.
         assert!(
             OpenAiProvider::new(
-                x2api_transport::Transport::direct(&x2api_kit::ServerConfig::default()),
+                opencode2api_transport::Transport::direct(
+                    &opencode2api_kit::ServerConfig::default()
+                ),
                 ServiceConfig {
                     name: "openai".into(),
                     base_url: "not a url".into(),
@@ -2783,7 +2788,7 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert("alias".to_string(), "real-model".to_string());
         let p = OpenAiProvider::new(
-            x2api_transport::Transport::direct(&x2api_kit::ServerConfig::default()),
+            opencode2api_transport::Transport::direct(&opencode2api_kit::ServerConfig::default()),
             ServiceConfig {
                 name: "openai".into(),
                 base_url: "https://x.test/v1".into(),
@@ -2889,7 +2894,7 @@ mod tests {
     /// free-tier gate treats as the public credential.
     fn zen_provider() -> OpenAiProvider {
         OpenAiProvider::new(
-            x2api_transport::Transport::direct(&x2api_kit::ServerConfig::default()),
+            opencode2api_transport::Transport::direct(&opencode2api_kit::ServerConfig::default()),
             ServiceConfig {
                 name: "openai".into(),
                 base_url: "https://opencode.ai/zen/v1".into(),
@@ -2924,7 +2929,8 @@ mod tests {
     }
 
     fn touch_guard() -> TouchOnDrop {
-        let transport = x2api_transport::Transport::direct(&x2api_kit::ServerConfig::default());
+        let transport =
+            opencode2api_transport::Transport::direct(&opencode2api_kit::ServerConfig::default());
         TouchOnDrop {
             lane: transport.lane().unwrap(),
             completed: false,
@@ -3463,8 +3469,9 @@ mod tests {
     /// one stays use-only, never a false success.
     #[test]
     fn trimmed_relay_completes_the_lane_only_when_done_reached_the_trim() {
-        use x2api_kit::sse::SseDecoder;
-        let transport = x2api_transport::Transport::direct(&x2api_kit::ServerConfig::default());
+        use opencode2api_kit::sse::SseDecoder;
+        let transport =
+            opencode2api_transport::Transport::direct(&opencode2api_kit::ServerConfig::default());
         let guard = || TouchOnDrop {
             lane: transport.lane().unwrap(),
             completed: false,

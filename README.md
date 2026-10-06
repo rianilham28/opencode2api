@@ -29,17 +29,17 @@ flow, workspace layout, contracts, and runbooks (in `AGENTS.md`).
 ## The request flow — two translations, opposite directions, one IR
 
 ```
-        client dialects (x2api-dialects)                upstream vendor (yours)
+        client dialects (opencode2api-dialects)                upstream vendor (yours)
 ┌──────────────────────────────────────────────────┐     ┌────────────────────────┐
 │ POST /v1/chat/completions            ─ chat      │     │                        │
 │ POST /v1/messages                    ─ anthropic │────▶│ ② IR ──► vendor wire   │
 │ POST /v1/responses                   ─ responses │     │ ③ vendor ──► IR chunks │
 │ POST /v1beta/models/{model}:…Content ─ gemini    │     │                        │
 └──────────────────────────────────────────────────┘     └────────────────────────┘
-                  x2api-server: pipeline, SSE relay, retry, envelopes
+                  opencode2api-server: pipeline, SSE relay, retry, envelopes
 ```
 
-1. **① inbound fold (`x2api-dialects`, vendor-blind).** Each client dialect
+1. **① inbound fold (`opencode2api-dialects`, vendor-blind).** Each client dialect
    has a module: request → IR (`ChatRequest`), and IR → that dialect's wire for
    responses AND streams. `-compat` is the identity fold (the IR *is*
    chat-completions-shaped, so its relay is verbatim and free).
@@ -56,15 +56,15 @@ flow, workspace layout, contracts, and runbooks (in `AGENTS.md`).
 
 ```
 crates/
-  x2api-kit               IR · Provider trait · ProviderError · SSE framing
+  opencode2api-kit               IR · Provider trait · ProviderError · SSE framing
                            (memchr) · backoff · ServerConfig · telemetry · wire
-  x2api-server             router · pipeline (auth gate, admission, retry) ·
+  opencode2api-server             router · pipeline (auth gate, admission, retry) ·
                            guarded stream relay · per-dialect error render ·
                            graceful two-stage drain · build_router() / run()
-  x2api-transport          upstream egress: warm lanes over sticky proxy
+  opencode2api-transport          upstream egress: warm lanes over sticky proxy
                            sessions, rotation, shards (optional — a service
                            with direct egress uses `Transport::direct`)
-  x2api-dialects           the inbound folds, one module each: chat
+  opencode2api-dialects           the inbound folds, one module each: chat
                            completions (identity), Anthropic Messages,
                            OpenAI Responses, Gemini generateContent
   service                  THE program (lib+bin): this deployment's provider.
@@ -76,7 +76,7 @@ config.example.json        server + proxy + provider sections (no secrets)
 config.production.example.json
                            systemd-shape policy; drift-pinned like its dev twin
 .env.example               the secrets those sections leave out
-deploy/x2api.service       hardened systemd unit (runbook: docs/production.md)
+deploy/opencode2api.service       hardened systemd unit (runbook: docs/production.md)
 docs/compliance/           source-verified provider reports (2026-09-06)
 AGENTS.md                  boundary doctrine — read before editing
 ```
@@ -94,22 +94,22 @@ curl :10080/v1/responses       -H "$H" -d '{"model":"…","input":"hi","stream":
 ```
 
 `.env` is read first and never overrides an already-exported variable, so an
-injected container secret beats a stale file; `X2API_ENV_FILE` points it
+injected container secret beats a stale file; `OPENCODE2API_ENV_FILE` points it
 elsewhere. Credentials go there rather than in `config.json` — a proxy URL
 carries a password. And `config.json` is secret too once
 `server.client_api_key` is set, so keep it `0640` (see `docs/production.md`).
 
 <!-- env-overrides:start -->
 Env overrides are pinned to the implementation. Service loading uses
-`X2API_CONFIG`, `X2API_ENV_FILE`, `X2API_BIND`, `X2API_PORT`,
-`X2API_EXTRA_BINDS`, `X2API_MAX_INFLIGHT`, `X2API_DRAIN_SECS`,
-`X2API_LOG_LEVEL`, `X2API_LOG_JSON`, `X2API_LOG_DIR`, `X2API_LOG_PREFIX`,
-`X2API_LOG_ROTATE`, `X2API_LOG_KEEP_FILES`, `X2API_LOG_STDOUT`,
-`X2API_CLIENT_API_KEY`, `X2API_RETRY_ATTEMPTS`, `X2API_HTTP2_PRIOR_KNOWLEDGE`,
-and `X2API_UPSTREAM_SHARDS`; `RUST_LOG` additionally selects per-crate logging.
-Provider credentials and endpoints use `X2API_UPSTREAM_URL`, `X2API_UPSTREAM_KEY`,
-and `X2API_UPSTREAM_KEYS` (rotated after 429/401). Egress uses
-`X2API_PROXY_URL`, `X2API_PROXY_LANES`, and `X2API_PROXY_SESSION_TTL_SECS`.
+`OPENCODE2API_CONFIG`, `OPENCODE2API_ENV_FILE`, `OPENCODE2API_BIND`, `OPENCODE2API_PORT`,
+`OPENCODE2API_EXTRA_BINDS`, `OPENCODE2API_MAX_INFLIGHT`, `OPENCODE2API_DRAIN_SECS`,
+`OPENCODE2API_LOG_LEVEL`, `OPENCODE2API_LOG_JSON`, `OPENCODE2API_LOG_DIR`, `OPENCODE2API_LOG_PREFIX`,
+`OPENCODE2API_LOG_ROTATE`, `OPENCODE2API_LOG_KEEP_FILES`, `OPENCODE2API_LOG_STDOUT`,
+`OPENCODE2API_CLIENT_API_KEY`, `OPENCODE2API_RETRY_ATTEMPTS`, `OPENCODE2API_HTTP2_PRIOR_KNOWLEDGE`,
+and `OPENCODE2API_UPSTREAM_SHARDS`; `RUST_LOG` additionally selects per-crate logging.
+Provider credentials and endpoints use `OPENCODE2API_UPSTREAM_URL`, `OPENCODE2API_UPSTREAM_KEY`,
+and `OPENCODE2API_UPSTREAM_KEYS` (rotated after 429/401). Egress uses
+`OPENCODE2API_PROXY_URL`, `OPENCODE2API_PROXY_LANES`, and `OPENCODE2API_PROXY_SESSION_TTL_SECS`.
 <!-- env-overrides:end -->
 Every completed request writes ONE line, and it is the short one: `request_id`,
 endpoint, format, `stream`, `result`, `status`, `duration_ms`, the model, and the
@@ -123,7 +123,7 @@ nothing else), so the provider's error warning and the retry warnings of the sam
 call are attributable in either layout.
 Config split is
 enforced: `server.*` is the template's surface, `proxy.*` belongs to
-`x2api-transport`, and `provider.*` is parsed by your service crate — never
+`opencode2api-transport`, and `provider.*` is parsed by your service crate — never
 by core.
 
 ## Pointing it at your upstream
@@ -148,7 +148,7 @@ the recipe. By hand, it is three files, in order:
    dialects, metrics, drain, retry, envelopes.
 
 Everything not in those three files is the frozen template — the correct
-edit for a new vendor is never `x2api-server`.
+edit for a new vendor is never `opencode2api-server`.
 
 **Forking the whole template as its own repo** is Runbook R2: three sed
 patterns (env prefix, crate/metric/id prefix, repo name) carry every
@@ -222,52 +222,52 @@ relay's sinks — to avoid compiling ~2300 lines that cost nothing to carry.
 
 Metrics worth alerting on:
 
-- `x2api_requests_total{endpoint,format,status}` — `status` is `200-committed`
+- `opencode2api_requests_total{endpoint,format,status}` — `status` is `200-committed`
   for a stream, since a stream's real outcome is not known when the headers go
-  out. `x2api_streams_total{endpoint,format,result}` carries that outcome:
+  out. `opencode2api_streams_total{endpoint,format,result}` carries that outcome:
   `ok` / `failed` / `truncated` / `panicked` / `dropped` (client vanished).
-- `x2api_request_duration_seconds{endpoint,stream}` — request lifetime from
+- `opencode2api_request_duration_seconds{endpoint,stream}` — request lifetime from
   request admission through the terminal outcome.
-- `x2api_tokens_total{endpoint,format,kind}` — what the UPSTREAM reported;
+- `opencode2api_tokens_total{endpoint,format,kind}` — what the UPSTREAM reported;
   `kind` is `prompt`, `completion`, `cached`, `reasoning`, `cache_creation`, or
   `cache_read`. The four detail kinds are emitted only when the upstream reports
   that counter. Counted on transcoded paths and on the verbatim relay (one field
   behind a byte scan, so frames without usage are never parsed). **Not counted
   on the fidelity lane:** its vendor-dialect bytes remain unparsed. Use the
   vendor's billing there, or fold instead of relaying.
-- `x2api_media_total{endpoint,format,kind}` — media parts the proxy ACCEPTED,
+- `opencode2api_media_total{endpoint,format,kind}` — media parts the proxy ACCEPTED,
   `kind` being `image` or `file`. Counted on the folded paths, where the parts
   are already in memory (the chat identity fold included), and **never on the
   fidelity lane**: reading media out of relayed bytes would give the lane the
   vendor knowledge it exists to avoid, exactly like its tokens. It answers "is
   the multimodal traffic actually arriving" — a vendor 400 only answers that
   after the request has failed — not "what did media cost".
-- `x2api_admission_queue_seconds{endpoint}` —
+- `opencode2api_admission_queue_seconds{endpoint}` —
   admission wait for every successful permit acquisition, including immediate
-  acquisitions. `x2api_stream_first_token_seconds{endpoint,format}` — TTFB for
+  acquisitions. `opencode2api_stream_first_token_seconds{endpoint,format}` — TTFB for
   counted streams that relayed a frame. NDJSON `queued_ms` and `ttfb_ms` remain
   useful per-request correlates.
-- `x2api_credentials{state}` — upstream keys by state, `ready` or `cooling`.
+- `opencode2api_credentials{state}` — upstream keys by state, `ready` or `cooling`.
   Published by `Pool` so a fork cannot forget it, and exported only when a pool
   exists: passthrough publishes no series, so an absent name and `ready 0` are
   different facts. Traffic refreshes it via `pick`, so an idle pool reports its
-  last observed state. `x2api_credential_cooldowns_total{reason}` records the
+  last observed state. `opencode2api_credential_cooldowns_total{reason}` records the
   cooldown episodes that produce those states.
-- `x2api_proxy_lanes{vendor}`, `x2api_proxy_lanes_desired`,
-  `x2api_proxy_lane_retirements_total{vendor,reason}` with reason
-  `idle|surplus|spent`, `x2api_proxy_lane_mint_failures_total{vendor}`,
-  `x2api_proxy_lane_shed_total{vendor="all"}`,
-  `x2api_proxy_lane_oldest_age_seconds{vendor}`,
-  `x2api_proxy_maintain_last_run_timestamp_seconds`, and
-  `x2api_proxy_lane_rotation_failures_total{vendor}` — pool capacity, demand,
-  upkeep, and health. `x2api_proxy_lanes_healthy{vendor,state}` uses state
+- `opencode2api_proxy_lanes{vendor}`, `opencode2api_proxy_lanes_desired`,
+  `opencode2api_proxy_lane_retirements_total{vendor,reason}` with reason
+  `idle|surplus|spent`, `opencode2api_proxy_lane_mint_failures_total{vendor}`,
+  `opencode2api_proxy_lane_shed_total{vendor="all"}`,
+  `opencode2api_proxy_lane_oldest_age_seconds{vendor}`,
+  `opencode2api_proxy_maintain_last_run_timestamp_seconds`, and
+  `opencode2api_proxy_lane_rotation_failures_total{vendor}` — pool capacity, demand,
+  upkeep, and health. `opencode2api_proxy_lanes_healthy{vendor,state}` uses state
   `healthy|unhealthy`. Pool-only families are absent in direct mode.
-- `x2api_proxy_lane_rotations_total{vendor}`,
-  `x2api_proxy_lane_failures_total{vendor}`, and
-  `x2api_proxy_prewarm_total{vendor}` — rotation, transport-failure, and
+- `opencode2api_proxy_lane_rotations_total{vendor}`,
+  `opencode2api_proxy_lane_failures_total{vendor}`, and
+  `opencode2api_proxy_prewarm_total{vendor}` — rotation, transport-failure, and
   prewarm counters; prewarms are the number to multiply when pricing a metered
   warm pool.
-- `x2api_proxy_lane_timeouts_total{vendor}` — response-header timeouts, counted
+- `opencode2api_proxy_lane_timeouts_total{vendor}` — response-header timeouts, counted
   and never charged to the lane. `reqwest` cannot tell a dead tunnel from a
   slow generation, so a timeout labels the VENDOR; only a connect fault (or a
   body that dies mid-flight) can retire an exit IP. A spike here is a slow
@@ -277,14 +277,14 @@ Metrics worth alerting on:
 What the template refuses to generalize is *policy*, and in both pools the
 seam for it is code in the provider crate, not a fork of the core. The egress
 bullets above are the mechanism, and the mechanism SHIPS: rotating proxy-session
-lanes, sharding, health, and prewarming live in `x2api-transport`. What it cannot
+lanes, sharding, health, and prewarming live in `opencode2api-transport`. What it cannot
 know is a vendor's session syntax when no URL template can spell it (the
 `ProxyVendor` seam), what that vendor's TTL unit actually means, or which
 failures were the LANE's fault rather than the vendor's — get those wrong and a
 healthy exit IP is retired on someone else's 429.
 
 Upstream *credential* pools draw the same line on the same terms: the mechanism
-is general (`x2api_kit::pool` — round-robin over secret-free slot indices,
+is general (`opencode2api_kit::pool` — round-robin over secret-free slot indices,
 per-slot cooldown, counts by state), the policy is not (`provider.rs` decides
 which statuses spend a key, for how long, and how far a vendor's `Retry-After`
 is trusted before being clamped).
@@ -331,7 +331,7 @@ file-relative path).
 
 ## Adding a dialect (Responses and Gemini are the proofs)
 
-One new module in `x2api-dialects` exposing `parse → IR`, `completion →
+One new module in `opencode2api-dialects` exposing `parse → IR`, `completion →
 wire`, and a stream state machine (`start/on_chunk/finish/fail` emitting
 that dialect's exact event grammar). Server touches are enumerated in
 AGENTS.md — the relay loop, retry, framing, and telemetry are never edited, and
@@ -434,7 +434,7 @@ copy-pasteable `models.yml`.
 `docs/client-omp-audit.md` — the client side: what omp requests and what each
 dialect can serve it today.
 `docs/production.md` — the systemd runbook: bring-up, multi-bind, the drain
-contract, simple security posture (`deploy/x2api.service` is the unit).
+contract, simple security posture (`deploy/opencode2api.service` is the unit).
 
 ## Egress through proxies — warm lanes, not a client per call
 
@@ -444,7 +444,7 @@ reuse*, not microseconds, is the whole performance story: a rotating endpoint
 CONNECT + TLS-to-proxy + TLS-to-upstream — 100–400 ms on a WAN, which dwarfs
 everything else this repo measures.
 
-`x2api-transport` answers that with **lanes**: one long-lived
+`opencode2api-transport` answers that with **lanes**: one long-lived
 `reqwest::Client` per sticky proxy session, warmed once and rotated on a timer
 while it is idle. You get rotation (N exit IPs, cycled) *and* warm
 connections, instead of trading one for the other.
@@ -494,7 +494,7 @@ What each part is defending:
   provider itself resolves (never a URL rebuilt here — a base that already
   carries `/v1` would probe `/v1/v1/models` and pay for a 404). It still
   repeats on every rotation, which is the pool's standing cost on a
-  bandwidth-billed plan: `x2api_proxy_prewarm_total` is there to be
+  bandwidth-billed plan: `opencode2api_proxy_prewarm_total` is there to be
   multiplied, and `prewarm` is switchable globally or per vendor.
 - **Credentials never leave `mint_lane`.** The URL holds a password; a lane
   identifies itself by vendor + session id in every log line, and `Lane`'s
@@ -527,7 +527,7 @@ be paid per request — which is what a rotating `ttl-0` endpoint charges you
 unconditionally.
 
 `server.upstream_shards` (per-vendor override: `shards`) stays on the server
-surface, because it tunes the client profile `x2api-transport` builds for
+surface, because it tunes the client profile `opencode2api-transport` builds for
 direct and proxied egress alike. It is the concurrency
 escape valve. HTTP/2 multiplexes every stream onto ONE connection per lane —
 excellent for handshakes, but it inherits the peer's
@@ -574,7 +574,7 @@ local number is the bench below.
 Two instruments, because one number cannot answer both questions a proxy
 raises.
 
-**`x2api-bench`** (the binary) runs the real proxy over loopback TCP against a
+**`opencode2api-bench`** (the binary) runs the real proxy over loopback TCP against a
 raw-socket mock upstream, in all three consumption modes plus a no-proxy
 floor. Every timed pass is gated by a sanity probe — the bench refuses to
 print numbers for a path that isn't correct.
@@ -584,11 +584,11 @@ with no I/O at all and decomposes the per-frame cost, because at ~1 µs/frame
 end-to-end the transport noise is the same order as the work.
 
 ```sh
-cargo run --release -p x2api-bench -- [--frames N] [--responses N] [--repeats N]
+cargo run --release -p opencode2api-bench -- [--frames N] [--responses N] [--repeats N]
       [-c 1,8,64] [--pace] [--pace-us N] [--buffered]
       [--payload ascii|unicode|tools] [--proxy-connect-ms N] [--lane-cold]
       [--json] [--baseline run.json] [--max-regress-pct N]
-cargo bench -p x2api-bench
+cargo bench -p opencode2api-bench
 ```
 
 Four axes, because one number per variant answers one question:

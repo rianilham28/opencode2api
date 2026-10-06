@@ -1,4 +1,4 @@
-//! Per-frame fold cost, decomposed — the half of the story `x2api-bench`
+//! Per-frame fold cost, decomposed — the half of the story `opencode2api-bench`
 //! cannot tell.
 //!
 //! The end-to-end bench measures the proxy over loopback TCP, so one number
@@ -16,16 +16,16 @@
 //! real generating model produces (one frame per read) and is the one whose
 //! per-call overhead the proxy actually pays in production.
 //!
-//!   cargo bench -p x2api-bench
+//!   cargo bench -p opencode2api-bench
 
 use bytes::BytesMut;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use opencode2api_dialects::anthropic::AnthropicStream;
+use opencode2api_dialects::chat::CompatStream;
+use opencode2api_dialects::responses::ResponsesStream;
+use opencode2api_kit::ChatChunk;
+use opencode2api_kit::sse::{self, SseDecoder, SseEvent};
 use std::hint::black_box;
-use x2api_dialects::anthropic::AnthropicStream;
-use x2api_dialects::chat::CompatStream;
-use x2api_dialects::responses::ResponsesStream;
-use x2api_kit::ChatChunk;
-use x2api_kit::sse::{self, SseDecoder, SseEvent};
 
 const PAD: &str = "the quick brown fox jumps over the lazy dog 0123456789";
 const FRAMES_PER_BATCH: usize = 64;
@@ -149,7 +149,7 @@ struct ParseChoicesOnly<'a> {
     #[serde(borrow, default)]
     choices: Vec<ParseChoice<'a>>,
     #[serde(default)]
-    usage: Option<x2api_kit::Usage>,
+    usage: Option<opencode2api_kit::Usage>,
 }
 
 /// Touch every parsed field so the optimizer cannot delete the work being
@@ -213,7 +213,7 @@ fn sinks(c: &mut Criterion) {
         })
     });
     g.bench_function("anthropic", |b| {
-        let mut s = AnthropicStream::new("bench", "x2api-bench");
+        let mut s = AnthropicStream::new("bench", "opencode2api-bench");
         let mut dst = BytesMut::with_capacity(4096);
         b.iter(|| {
             s.on_chunk_into(black_box(&chunk), &mut dst);
@@ -221,7 +221,7 @@ fn sinks(c: &mut Criterion) {
         })
     });
     g.bench_function("responses", |b| {
-        let mut s = ResponsesStream::new("bench", "x2api-bench");
+        let mut s = ResponsesStream::new("bench", "opencode2api-bench");
         let mut dst = BytesMut::with_capacity(4096);
         b.iter(|| {
             s.on_chunk_into(black_box(&chunk), &mut dst);
@@ -240,7 +240,7 @@ fn end_to_end(c: &mut Criterion) {
     g.throughput(Throughput::Elements(1));
     g.bench_function("anthropic_frame", |b| {
         let mut decoder = SseDecoder::new();
-        let mut sink = AnthropicStream::new("bench", "x2api-bench");
+        let mut sink = AnthropicStream::new("bench", "opencode2api-bench");
         let mut dst = BytesMut::with_capacity(4096);
         b.iter(|| {
             for event in decoder.push(black_box(&frame)).expect("unbounded decoder") {

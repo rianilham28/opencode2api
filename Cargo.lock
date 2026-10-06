@@ -1418,6 +1418,107 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
+name = "opencode2api-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "criterion",
+ "http",
+ "memchr",
+ "mimalloc",
+ "opencode2api-dialects",
+ "opencode2api-kit",
+ "opencode2api-server",
+ "opencode2api-transport",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "service",
+ "tokio",
+]
+
+[[package]]
+name = "opencode2api-dialects"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "opencode2api-kit",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "opencode2api-kit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "dotenvy",
+ "futures-util",
+ "http",
+ "jiff",
+ "memchr",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "metrics-util",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "opencode2api-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "bytes",
+ "futures-util",
+ "http",
+ "memchr",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "metrics-util",
+ "opencode2api-dialects",
+ "opencode2api-kit",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tower-http 0.7.1",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "opencode2api-transport"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "metrics",
+ "metrics-util",
+ "opencode2api-kit",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2042,16 +2143,16 @@ dependencies = [
  "metrics",
  "metrics-util",
  "mimalloc",
+ "opencode2api-dialects",
+ "opencode2api-kit",
+ "opencode2api-server",
+ "opencode2api-transport",
  "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
- "x2api-dialects",
- "x2api-kit",
- "x2api-server",
- "x2api-transport",
 ]
 
 [[package]]
@@ -2855,107 +2956,6 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
-
-[[package]]
-name = "x2api-bench"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "criterion",
- "http",
- "memchr",
- "mimalloc",
- "reqwest",
- "serde",
- "serde_json",
- "service",
- "tokio",
- "x2api-dialects",
- "x2api-kit",
- "x2api-server",
- "x2api-transport",
-]
-
-[[package]]
-name = "x2api-dialects"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "serde",
- "serde_json",
- "x2api-kit",
-]
-
-[[package]]
-name = "x2api-kit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "dotenvy",
- "futures-util",
- "http",
- "jiff",
- "memchr",
- "metrics",
- "metrics-exporter-prometheus",
- "metrics-util",
- "parking_lot",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "x2api-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "axum",
- "bytes",
- "futures-util",
- "http",
- "memchr",
- "metrics",
- "metrics-exporter-prometheus",
- "metrics-util",
- "parking_lot",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tower",
- "tower-http 0.7.1",
- "tracing",
- "tracing-subscriber",
- "x2api-dialects",
- "x2api-kit",
-]
-
-[[package]]
-name = "x2api-transport"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "metrics",
- "metrics-util",
- "parking_lot",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "x2api-kit",
-]
 
 [[package]]
 name = "yoke"

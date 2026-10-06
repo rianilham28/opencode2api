@@ -6,19 +6,19 @@
 
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
+use opencode2api_kit::ServerConfig;
+use opencode2api_server::Pipeline;
 use serde_json::{Value, json};
 use service::{OpenAiProvider, ServiceConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use x2api_kit::ServerConfig;
-use x2api_server::Pipeline;
 
 static PROXY_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const PROXY_ENV: [&str; 3] = [
-    x2api_kit::config::ENV_PROXY_URL,
-    x2api_kit::config::ENV_PROXY_LANES,
-    x2api_kit::config::ENV_PROXY_SESSION_TTL_SECS,
+    opencode2api_kit::config::ENV_PROXY_URL,
+    opencode2api_kit::config::ENV_PROXY_LANES,
+    opencode2api_kit::config::ENV_PROXY_SESSION_TTL_SECS,
 ];
 
 fn proxy_env_lock() -> MutexGuard<'static, ()> {
@@ -432,7 +432,7 @@ async fn serve(pipeline: Pipeline) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, x2api_server::build_router(pipeline))
+        axum::serve(listener, opencode2api_server::build_router(pipeline))
             .await
             .unwrap();
     });
@@ -467,9 +467,9 @@ fn client() -> reqwest::Client {
 /// socket suite exercises an untuned path the shipped binary never runs.
 /// Direct egress: these tests measure the provider against a real socket, so
 /// the transport is the no-proxy one (the pool's own behavior is covered by
-/// x2api-kit's transport tests and the proxied test below).
-fn client_for(cfg: &ServerConfig) -> std::sync::Arc<x2api_transport::Transport> {
-    x2api_transport::Transport::direct(cfg)
+/// opencode2api-kit's transport tests and the proxied test below).
+fn client_for(cfg: &ServerConfig) -> std::sync::Arc<opencode2api_transport::Transport> {
+    opencode2api_transport::Transport::direct(cfg)
 }
 
 /// Frames carry deliberate insertion order (`id,model,object` — not the
@@ -1463,7 +1463,7 @@ async fn responses_dialect_over_real_upstream() {
 /// shipped examples go through the REAL boot gates: serde against the
 /// structs, `socket_addrs` (a non-resolvable bind must fail before the
 /// drift test, not at first boot), and `ProxyConfig::from_doc` (which
-/// validates, mirroring x2api-transport's own example test).
+/// validates, mirroring opencode2api-transport's own example test).
 #[test]
 fn example_config_parses_as_the_documented_shape() {
     let _env_lock = proxy_env_lock();
@@ -1487,7 +1487,7 @@ fn example_config_parses_as_the_documented_shape() {
         // Boot gate the same way the bin does: addresses resolve (extras
         // included), and the proxy section is either absent or valid.
         assert!(!server.socket_addrs().unwrap().is_empty(), "{file}");
-        let proxy = x2api_transport::ProxyConfig::from_doc(&doc)
+        let proxy = opencode2api_transport::ProxyConfig::from_doc(&doc)
             .unwrap_or_else(|e| panic!("{file} proxy section must load: {e}"));
         assert_eq!(proxy.is_some(), doc.get("proxy").is_some(), "{file}");
     }
@@ -1503,8 +1503,8 @@ async fn proxy_lane_puts_a_minted_session_on_the_wire() {
     // reply can only mean the request went through the lane.
     let (proxy_mock, state) = mock_upstream(vec![Reply::Sse(SSE_STREAM)]).await;
     let (server, provider) = cfg_for("http://192.0.2.1:9");
-    let proxy = x2api_transport::ProxyConfig {
-        vendors: vec![x2api_transport::ProxyVendorConfig {
+    let proxy = opencode2api_transport::ProxyConfig {
+        vendors: vec![opencode2api_transport::ProxyVendorConfig {
             name: "testvendor".into(),
             url: format!(
                 "http://user-acct-session-{{session}}-ttl-{{ttl_seconds}}:secret@{}",
@@ -1518,7 +1518,8 @@ async fn proxy_lane_puts_a_minted_session_on_the_wire() {
         prewarm: false,
         ..Default::default()
     };
-    let transport = x2api_transport::Transport::with_proxy(&server, &proxy).expect("pool builds");
+    let transport =
+        opencode2api_transport::Transport::with_proxy(&server, &proxy).expect("pool builds");
     let pipeline = Pipeline::new(
         Arc::new(OpenAiProvider::new(transport, provider).unwrap()),
         Arc::new(server),
@@ -1574,8 +1575,8 @@ fn single_lane_pool(
 ) -> (
     ServerConfig,
     ServiceConfig,
-    Arc<x2api_transport::Transport>,
-    Arc<x2api_transport::Lane>,
+    Arc<opencode2api_transport::Transport>,
+    Arc<opencode2api_transport::Lane>,
 ) {
     let (server, provider, transport) = lane_pool(proxy, |v| {
         v.url = format!("http://session-{{session}}:secret@{}", proxy.0)
@@ -1886,10 +1887,14 @@ fn wire_requests(state: &MockState) -> Vec<(usize, String)> {
 /// explicitly rather than relying on the pool default.
 fn lane_pool(
     proxy: &Socket,
-    tune: impl FnOnce(&mut x2api_transport::ProxyVendorConfig),
-) -> (ServerConfig, ServiceConfig, Arc<x2api_transport::Transport>) {
+    tune: impl FnOnce(&mut opencode2api_transport::ProxyVendorConfig),
+) -> (
+    ServerConfig,
+    ServiceConfig,
+    Arc<opencode2api_transport::Transport>,
+) {
     let (server, provider) = cfg_for("http://192.0.2.1:9");
-    let mut vendor = x2api_transport::ProxyVendorConfig {
+    let mut vendor = opencode2api_transport::ProxyVendorConfig {
         name: "testvendor".into(),
         url: format!("http://user-session-{{session}}:secret@{}", proxy.0),
         min_lanes: 1,
@@ -1900,12 +1905,13 @@ fn lane_pool(
         ..Default::default()
     };
     tune(&mut vendor);
-    let config = x2api_transport::ProxyConfig {
+    let config = opencode2api_transport::ProxyConfig {
         vendors: vec![vendor],
         prewarm: false,
         ..Default::default()
     };
-    let transport = x2api_transport::Transport::with_proxy(&server, &config).expect("pool builds");
+    let transport =
+        opencode2api_transport::Transport::with_proxy(&server, &config).expect("pool builds");
     (server, provider, transport)
 }
 
@@ -2256,7 +2262,7 @@ async fn an_upstream_429_and_500_leave_the_lane_in_rotation() {
 /// mutating `is_ready()` was measured against the accept-count version of
 /// this test and left it PASSING — zero accepts, zero requests, because
 /// nothing connected. What a mint does emit is `publish_pool_metrics`, so
-/// `x2api_proxy_lanes` is the only observable separating "did not mint" from
+/// `opencode2api_proxy_lanes` is the only observable separating "did not mint" from
 /// "minted a lane that never connected". The two wire counts are kept
 /// alongside it because they prove the half no gauge can: readiness never
 /// TOUCHES the vendor, so it costs no quota.
@@ -2266,7 +2272,7 @@ async fn an_upstream_429_and_500_leave_the_lane_in_rotation() {
 /// when the closure returns, so an async body would record onto the global
 /// recorder instead and the snapshot would come back empty. A current-thread
 /// runtime keeps the served router's work on this thread — the pattern
-/// x2api-server's tests and transport's own lifecycle tests already use.
+/// opencode2api-server's tests and transport's own lifecycle tests already use.
 #[test]
 fn readiness_probes_never_mint_a_lane_or_touch_the_vendor() {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -2281,12 +2287,12 @@ fn readiness_probes_never_mint_a_lane_or_touch_the_vendor() {
     let (proxy_mock, state) = rt.block_on(mock_upstream(vec![Reply::KeepAlive(BUFFERED)]));
 
     metrics::with_local_recorder(&recorder, || {
-        // Snapshot-and-scan, the shape x2api-kit's pool gauge test uses: a
+        // Snapshot-and-scan, the shape opencode2api-kit's pool gauge test uses: a
         // gauge holds one value per label set, so each phase reads the series
         // fresh instead of trusting an earlier reading.
         let lanes = |vendor: &str| -> Option<f64> {
             for (key, _, _, value) in snapshotter.snapshot().into_vec() {
-                if key.key().name() != x2api_transport::names::LANES
+                if key.key().name() != opencode2api_transport::names::LANES
                     || !key
                         .key()
                         .labels()
@@ -2405,7 +2411,7 @@ fn readiness_probes_never_mint_a_lane_or_touch_the_vendor() {
 async fn two_vendors_are_seen_on_the_wire_in_their_own_spellings() {
     let (proxy_mock, state) = mock_upstream(vec![Reply::KeepAlive(BUFFERED)]).await;
     let (server, provider) = cfg_for("http://192.0.2.1:9");
-    let vendor = |name: &str, url: &str| x2api_transport::ProxyVendorConfig {
+    let vendor = |name: &str, url: &str| opencode2api_transport::ProxyVendorConfig {
         name: name.into(),
         url: url.into(),
         min_lanes: 1,
@@ -2415,7 +2421,7 @@ async fn two_vendors_are_seen_on_the_wire_in_their_own_spellings() {
         prewarm: Some(false),
         ..Default::default()
     };
-    let config = x2api_transport::ProxyConfig {
+    let config = opencode2api_transport::ProxyConfig {
         vendors: vec![
             vendor(
                 "alpha",
@@ -2429,7 +2435,8 @@ async fn two_vendors_are_seen_on_the_wire_in_their_own_spellings() {
         prewarm: false,
         ..Default::default()
     };
-    let transport = x2api_transport::Transport::with_proxy(&server, &config).expect("pool builds");
+    let transport =
+        opencode2api_transport::Transport::with_proxy(&server, &config).expect("pool builds");
     let addr = serve(Pipeline::new(
         Arc::new(OpenAiProvider::new(transport, provider).unwrap()),
         Arc::new(server),
@@ -2521,8 +2528,8 @@ async fn the_egress_metric_family_is_exposed_with_help() {
     // at construction, so a recorder installed afterwards renders a family
     // whose data went to the void while its HELP text still shows up. This is
     // the order the composition root uses (service/src/main.rs).
-    let handle = x2api_kit::telemetry::install_metrics().expect("recorder installs");
-    x2api_transport::describe_metrics();
+    let handle = opencode2api_kit::telemetry::install_metrics().expect("recorder installs");
+    opencode2api_transport::describe_metrics();
     let (proxy_mock, _state) = mock_upstream(vec![Reply::KeepAlive(BUFFERED)]).await;
     let (server, provider, transport) = lane_pool(&proxy_mock, |v| v.name = VENDOR.to_string());
     let lane = transport.lane().expect("lane");
@@ -2538,7 +2545,7 @@ async fn the_egress_metric_family_is_exposed_with_help() {
         text.lines()
             .find_map(|l| l.strip_prefix(series)?.trim().parse::<u64>().ok())
     };
-    let series = format!(r#"x2api_proxy_lane_failures_total{{vendor="{VENDOR}"}} "#);
+    let series = format!(r#"opencode2api_proxy_lane_failures_total{{vendor="{VENDOR}"}} "#);
 
     // Two failures this test causes and no other: a DELTA, so the assertion
     // survives both a recorder other tests have written into and any change to
@@ -2564,13 +2571,16 @@ async fn the_egress_metric_family_is_exposed_with_help() {
         .text()
         .await
         .unwrap();
-    let egress: Vec<&str> = text.lines().filter(|l| l.contains("x2api_proxy")).collect();
+    let egress: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("opencode2api_proxy"))
+        .collect();
     // A family that RECORDS but is never DESCRIBED renders its data lines with
     // no help text at all, and a data-only assertion would stay green on it.
     for name in [
-        x2api_transport::names::FAILURES,
-        x2api_transport::names::HEALTHY,
-        x2api_transport::names::LANES,
+        opencode2api_transport::names::FAILURES,
+        opencode2api_transport::names::HEALTHY,
+        opencode2api_transport::names::LANES,
     ] {
         assert!(
             text.contains(&format!("# HELP {name} ")),
@@ -2582,15 +2592,16 @@ async fn the_egress_metric_family_is_exposed_with_help() {
     // sorted. Match the name and the label values rather than one concatenated
     // literal, so a label-order change this test does not own cannot fail it.
     assert!(
-        text.lines().any(|l| l.starts_with("x2api_proxy_lanes{")
-            && l.contains(&format!("vendor=\"{VENDOR}\""))
-            && l.ends_with(" 1")),
+        text.lines()
+            .any(|l| l.starts_with("opencode2api_proxy_lanes{")
+                && l.contains(&format!("vendor=\"{VENDOR}\""))
+                && l.ends_with(" 1")),
         "lane counts are exposed per vendor:\n{}",
         egress.join("\n")
     );
     assert!(
         text.lines()
-            .any(|l| l.starts_with("x2api_proxy_lanes_healthy{")
+            .any(|l| l.starts_with("opencode2api_proxy_lanes_healthy{")
                 && l.contains(&format!("vendor=\"{VENDOR}\""))
                 && l.contains("state=\"healthy\"")
                 && l.ends_with(" 1")),

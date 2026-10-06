@@ -17,14 +17,14 @@ path = "src/lib.rs"
 # Rename this to whatever you deploy as; nothing in the workspace depends on
 # the binary's name, which is the point of the crate not being named after a
 # vendor any more.
-name = "x2api"
+name = "opencode2api"
 path = "src/main.rs"
 
 [dependencies]
-x2api-kit = { workspace = true }
-x2api-transport = { workspace = true }
-x2api-dialects = { workspace = true }
-x2api-server = { workspace = true }
+opencode2api-kit = { workspace = true }
+opencode2api-transport = { workspace = true }
+opencode2api-dialects = { workspace = true }
+opencode2api-server = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 async-trait = { workspace = true }

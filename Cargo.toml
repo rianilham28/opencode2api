@@ -25,10 +25,10 @@ all = "deny"
 
 [workspace.dependencies]
 # --- internal crates (every service bin depends on these three) ---
-x2api-kit = { path = "crates/x2api-kit" }
-x2api-dialects = { path = "crates/x2api-dialects" }
-x2api-server = { path = "crates/x2api-server" }
-x2api-transport = { path = "crates/x2api-transport" }
+opencode2api-kit = { path = "crates/opencode2api-kit" }
+opencode2api-dialects = { path = "crates/opencode2api-dialects" }
+opencode2api-server = { path = "crates/opencode2api-server" }
+opencode2api-transport = { path = "crates/opencode2api-transport" }
 
 # --- runtime / web ---
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "macros", "signal", "sync", "time"] }
@@ -88,4 +88,4 @@ strip = true
 debug = false
 # No `panic = "abort"`: a panic while serving one request unwinds that task
 # only, so the proxy keeps serving everything else. The panic->500 layer in
-# x2api-server depends on unwinding.
+# opencode2api-server depends on unwinding.

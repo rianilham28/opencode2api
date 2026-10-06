@@ -1,4 +1,4 @@
-// hk — git hook + repo check runner (https://hk.jdx.dev) for the x2api workspace.
+// hk — git hook + repo check runner (https://hk.jdx.dev) for the opencode2api workspace.
 //
 // This file DEFINES the gate; mise.toml's `[hooks] postinstall = "hk install --mise"`
 // REGISTERS it, so `mise trust && mise install` on a fresh clone writes

@@ -10,23 +10,23 @@ path, metrics render, SIGTERM drain → exit 0), not aspirational.
 
 | File | Holds | Mode | Owner |
 |---|---|---|---|
-| `/etc/x2api/config.json` | policy: binds, timeouts, `client_api_key`, log/rotate | `0640` | `x2api` |
-| `/etc/x2api/.env` | secrets: `X2API_UPSTREAM_KEY`, `X2API_UPSTREAM_KEYS`, upstream URL override | `0600` | `x2api` |
-| `/var/log/x2api/` | the proxy's own rotating log (via `LogsDirectory`) | `0750` | `x2api` |
-| `deploy/x2api.service` → `/etc/systemd/system/` | the unit | `0644` | root |
+| `/etc/opencode2api/config.json` | policy: binds, timeouts, `client_api_key`, log/rotate | `0640` | `opencode2api` |
+| `/etc/opencode2api/.env` | secrets: `OPENCODE2API_UPSTREAM_KEY`, `OPENCODE2API_UPSTREAM_KEYS`, upstream URL override | `0600` | `opencode2api` |
+| `/var/log/opencode2api/` | the proxy's own rotating log (via `LogsDirectory`) | `0750` | `opencode2api` |
+| `deploy/opencode2api.service` → `/etc/systemd/system/` | the unit | `0644` | root |
 
 `config.json` holds `server.client_api_key`, so it is a secret too:
-**0640 group `x2api`**, like `.env` at 0600 — the FILES carry the protection.
+**0640 group `opencode2api`**, like `.env` at 0600 — the FILES carry the protection.
 The directories are created explicitly because systemd does not retroactively
 take ownership or mode of an existing `ConfigurationDirectory`. With
 `ConfigurationDirectoryMode=0750`, an existing config directory keeps the
 ownership/mode from step 1; if it were absent, systemd would create it
-root-owned, which `User=x2api` cannot read. `StateDirectoryMode=0750` and
-`LogsDirectoryMode=0750` make `/var/lib/x2api` and `/var/log/x2api`
-`x2api:x2api` `0750`.
-The loader (`x2api_kit::load_dotenv`) reads the path in `X2API_ENV_FILE`
+root-owned, which `User=opencode2api` cannot read. `StateDirectoryMode=0750` and
+`LogsDirectoryMode=0750` make `/var/lib/opencode2api` and `/var/log/opencode2api`
+`opencode2api:opencode2api` `0750`.
+The loader (`opencode2api_kit::load_dotenv`) reads the path in `OPENCODE2API_ENV_FILE`
 first and never overwrites a variable the environment already set — so a
-one-off `X2API_UPSTREAM_KEY=… systemctl edit` override wins over the file.
+one-off `OPENCODE2API_UPSTREAM_KEY=… systemctl edit` override wins over the file.
 
 ## Bring-up (run as root on the target box)
 
@@ -37,35 +37,35 @@ automated"). It is not boot-verified from this macOS box (no systemd here);
 the binary behaviours it encodes ARE run-verified: SIGTERM drain → exit 0,
 bind-all-before-serve (occupied extra ⇒ boot error `binding …: Address already
 in use`, no socket served), and gated 401. First action on the target after
-install: `systemd-analyze verify /etc/systemd/system/x2api.service`.
+install: `systemd-analyze verify /etc/systemd/system/opencode2api.service`.
 
 ```sh
 # 1. service user (the unit pins User/Group) and explicitly-owned managed
 #    dirs. ConfigurationDirectory is load-bearing: systemd does not chown/chmod
 #    an existing one, and a missing one would be created root-owned 0750.
-useradd --system --no-create-home --shell /usr/sbin/nologin x2api
-install -d -m 0750 -o x2api -g x2api /etc/x2api /var/lib/x2api /var/log/x2api
+useradd --system --no-create-home --shell /usr/sbin/nologin opencode2api
+install -d -m 0750 -o opencode2api -g opencode2api /etc/opencode2api /var/lib/opencode2api /var/log/opencode2api
 
 # 2. build and install the binary; install the two shipped config
 #    templates. Configs are 0640 because the proxy config holds client_api_key.
 cargo build --release -p service
-install -m 0755 target/release/x2api /usr/local/bin/
-install -m 0640 config.production.example.json /etc/x2api/config.json
-install -m 0600 .env.example /etc/x2api/.env
+install -m 0755 target/release/opencode2api /usr/local/bin/
+install -m 0640 config.production.example.json /etc/opencode2api/config.json
+install -m 0600 .env.example /etc/opencode2api/.env
 
-# 3. EDIT before starting: client_api_key in config.json; X2API_UPSTREAM_URL
-#    AND X2API_UPSTREAM_KEY in .env. The env URL overrides provider.base_url,
+# 3. EDIT before starting: client_api_key in config.json; OPENCODE2API_UPSTREAM_URL
+#    AND OPENCODE2API_UPSTREAM_KEY in .env. The env URL overrides provider.base_url,
 #    so both sources must agree. The .env comments carry the other deployment
-#    knobs; the full override list is apply_env in x2api-kit and README lists
+#    knobs; the full override list is apply_env in opencode2api-kit and README lists
 #    the common ones. Then hand the service user its files — the unit uses a
 #    stable User, not DynamicUser, so 0600 on .env is readable:
-chown x2api:x2api /etc/x2api/config.json /etc/x2api/.env /var/lib/x2api /var/log/x2api
+chown opencode2api:opencode2api /etc/opencode2api/config.json /etc/opencode2api/.env /var/lib/opencode2api /var/log/opencode2api
 
 # 4. install the unit (+ the runbook), reload systemd, and enable it.
-install -m 0644 deploy/x2api.service /etc/systemd/system/
-install -D -m 0644 docs/production.md /usr/share/doc/x2api/production.md
+install -m 0644 deploy/opencode2api.service /etc/systemd/system/
+install -D -m 0644 docs/production.md /usr/share/doc/opencode2api/production.md
 systemctl daemon-reload
-systemctl enable --now x2api
+systemctl enable --now opencode2api
 ```
 
 ## Verify (the exact checks run on this tree)
@@ -73,7 +73,7 @@ systemctl enable --now x2api
 ```sh
 curl -fs localhost:10080/health          # {"status":"ok"} — liveness, no auth
 curl -fs localhost:10080/ready           # {"status":"ready"} — direct mode; lane health if pooled
-curl -s localhost:10080/metrics | head   # x2api_requests_total … after first req
+curl -s localhost:10080/metrics | head   # opencode2api_requests_total … after first req
 # authed call: correct key reaches upstream, wrong/missing key is 401
 curl -o /dev/null -w '%{http_code}\n' -X POST localhost:10080/v1/chat/completions \
      -H 'content-type: application/json' -d '{"model":"m","messages":[]}'   # 401
@@ -109,7 +109,7 @@ Prefer two proxy units (one per socket) if you want per-face isolation via
 policy (they almost always do). Env override for quick tests, no file edit:
 
 ```sh
-X2API_EXTRA_BINDS="127.0.0.1:8081,[::1]:8081"   # comma list, blanks dropped
+OPENCODE2API_EXTRA_BINDS="127.0.0.1:8081,[::1]:8081"   # comma list, blanks dropped
 ```
 
 ## Drain / restart contract (why TimeoutStopSec=40)
@@ -168,13 +168,13 @@ rate limiting.** What actually protects the box:
   pages; OpenAI's image-input guide says 512 MB), so deployments that fold
   documents must raise this value deliberately and revisit the memory budget.
 - systemd `ProtectSystem=strict` + no capabilities + private /tmp + device
-  isolation. The process can write only `/var/lib/x2api`, `/var/log/x2api`,
-  and read `/etc/x2api`.
+  isolation. The process can write only `/var/lib/opencode2api`, `/var/log/opencode2api`,
+  and read `/etc/opencode2api`.
 
 ## What is not automated, and why
 
 There is no CD pipeline, and the deployment shape is the reason: the build host IS
-the run host (step 2 installs `target/release/x2api` where it will execute), so no
+the run host (step 2 installs `target/release/opencode2api` where it will execute), so no
 artifact ever crosses a machine and a distribution matrix would have nothing to
 grade. The axes that do exist are covered by CI: the compiler's floor by
 `gate.yml`'s `msrv` job, the shipping profile by its `release` job
@@ -190,7 +190,7 @@ Three things stay on a human, each for a reason:
   credentials live in a `0600` `.env`. A pipeline that owns either becomes the secret
   issuer, and a pipeline that ships the config ships a client-facing secret inside a
   build artifact. R2's rsync excluding `.env*` applies the same rule to forks.
-- **Ownership and modes.** Pre-created config directory `x2api:x2api` `0750`,
+- **Ownership and modes.** Pre-created config directory `opencode2api:opencode2api` `0750`,
   state/log directories systemd-managed at `0750`, config `0640`, `.env` `0600`,
   and files handed to a stable `User=`. Wrong in either direction and the
   service either reads nothing or the key is world-readable.
@@ -224,14 +224,14 @@ section keeps having to retract.
 
 ```sh
 # upgrade: preserve the installed binary, then install the rebuilt one
-cp -p /usr/local/bin/x2api /usr/local/bin/x2api.old
-install -m 0755 target/release/x2api /usr/local/bin/
-systemctl restart x2api
-journalctl -u x2api -n 50 --no-pager
+cp -p /usr/local/bin/opencode2api /usr/local/bin/opencode2api.old
+install -m 0755 target/release/opencode2api /usr/local/bin/
+systemctl restart opencode2api
+journalctl -u opencode2api -n 50 --no-pager
 
 # rollback: restore the preserved binary
-install -m 0755 /usr/local/bin/x2api.old /usr/local/bin/x2api
-systemctl restart x2api
+install -m 0755 /usr/local/bin/opencode2api.old /usr/local/bin/opencode2api
+systemctl restart opencode2api
 ```
 
 Config and `.env` survive restarts untouched. `deny_unknown_fields` means a
@@ -265,7 +265,7 @@ The shape that answers questions:
 - **Scrape noise is not logged; every client-visible refusal is.** A miss on
   `/health` or `/metrics` writes nothing (a poller would drown the file), while a
   404 or a wrong-method probe records `endpoint="unmatched"` — in the log AND in
-  `x2api_requests_total{endpoint="unmatched"}`, because "am I being scanned" is a
+  `opencode2api_requests_total{endpoint="unmatched"}`, because "am I being scanned" is a
   question the counter answers and the "mysteriously can't list models" ticket is
   one the log answers.
 - **Absence means "not measured", or nothing happened.** An unrecorded field is
@@ -286,7 +286,7 @@ per-crate lever and accepts directives). Measured against the binary: with
 `"warn"` and the same traffic that produced records at `"info"`, the rotating
 file was EMPTY — not because logging broke, but because every line this proxy
 writes on a healthy request is `info` — which means a restart at `warn` also
-drops the `configuration` boot record and `x2api listening`, so the journal shows
+drops the `configuration` boot record and `opencode2api listening`, so the journal shows
 nothing about what the process is set to do. `RUST_LOG=info` for one restart when
 you need that line, rather than turning the level back on for good.
 So `warn` buys quiet by giving up correlation as well: the request span is an
@@ -311,14 +311,14 @@ Bounds, honestly stated:
 - **`log_stdout: true` is on in both shipped examples, and the production one
   keeps it on for a reason**: the appender worker swallows every write error
   (a full disk included), so the mirror is the only witness that the file
-  stream died. It is also what `journalctl -u x2api` shows — with `log_dir`
+  stream died. It is also what `journalctl -u opencode2api` shows — with `log_dir`
   configured and `log_stdout: false`, a systemd service logs NOTHING to its
   journal after the subscriber installs, and every "check the service" step in
   this runbook silently returns empty while the proxy is behaving perfectly.
   That is a real operational failure mode, not a cosmetic one: a machine with
   `/var/log` full loses the file mid-stream, and the journal is where an
   operator looks. If you do turn it off to stop the duplication, change the
-  verification commands to `tail /var/log/x2api/x2api.<period>.log`.
+  verification commands to `tail /var/log/opencode2api/opencode2api.<period>.log`.
 - The journal half is bounded by journald, not by this proxy: `log_keep_files`
   counts period FILES only, and a unit-level quota does not apply to the shared
   journal, so `SystemMaxUse=` in `journald.conf` is the knob that makes
@@ -339,51 +339,51 @@ Bounds, honestly stated:
   restarting it. In direct-egress mode, which the shipped production example
   uses, readiness is intentionally true whenever the process is running and
   does not probe upstream.
-- Alert on the 503 ratio `x2api_requests_total{status="503"}` divided by all
-  `x2api_requests_total` series. For a pool-backed deployment, sustained
+- Alert on the 503 ratio `opencode2api_requests_total{status="503"}` divided by all
+  `opencode2api_requests_total` series. For a pool-backed deployment, sustained
   `/ready` 503 is also a signal. Labels cannot distinguish the three 503
   producers: inspect the terminal NDJSON `result` (`shed`, `failed`), its
   distinct error message, and `Retry-After` (literal `5` for admission shed,
   derived wait for exhausted credentials). `status` is not uniformly numeric:
   committed streams use `status="200-committed"` when the provider hands back a
   stream, before its first frame; this counts streams STARTED, not successes.
-  Their outcomes are `x2api_streams_total{result=...}`.
-- Alert on `x2api_requests_total{status="504"}`, then confirm the terminal log
+  Their outcomes are `opencode2api_streams_total{result=...}`.
+- Alert on `opencode2api_requests_total{status="504"}`, then confirm the terminal log
   `result="timeout"`: a vendor-originated 504 uses the same labels. This catches
   proxy breaches of `request_timeout_secs` (pre-handoff stream setup, buffered
   generation, fidelity handoff, and model listings). Post-handoff
   `stream_deadline_secs` truncation appears in
-  `x2api_streams_total{result="truncated"}` instead.
+  `opencode2api_streams_total{result="truncated"}` instead.
 - For proxy-pool deployments only, alert on
-  `x2api_proxy_lane_failures_total{vendor}`,
-  `x2api_proxy_lane_rotations_total{vendor}`, and the labeled
-  `x2api_proxy_lanes_healthy{vendor,state}` gauge; use
-  `x2api_proxy_prewarm_total{vendor}` rate × per-probe cost for warm-pool
-  pricing. `x2api_proxy_lane_timeouts_total{vendor}` is a VENDOR-slowness
+  `opencode2api_proxy_lane_failures_total{vendor}`,
+  `opencode2api_proxy_lane_rotations_total{vendor}`, and the labeled
+  `opencode2api_proxy_lanes_healthy{vendor,state}` gauge; use
+  `opencode2api_proxy_prewarm_total{vendor}` rate × per-probe cost for warm-pool
+  pricing. `opencode2api_proxy_lane_timeouts_total{vendor}` is a VENDOR-slowness
   signal, not a lane-health one: a rate there means the upstream stopped
   answering within the read timeout, and no lane was retired for it. A
   rotation-failure rate that is not accompanied by successful rotations means
   the vendor is down — the pool then backs off from 30 s to 10 min per attempt
   rather than probing every tick, so the prewarm rate flattens on its own.
   The shipped config has no `proxy` section. Direct mode can record
-  `x2api_proxy_lane_failures_total{vendor="direct"}` on transport failure, but
+  `opencode2api_proxy_lane_failures_total{vendor="direct"}` on transport failure, but
   has no pool maintenance: healthy, rotation, and prewarm families are absent.
 - For credential pools with at least two keys, alert on
-  `x2api_credential_cooldowns_total{reason}` and the separate
-  `x2api_credentials{state="ready"}` / `{state="cooling"}` gauges as a leading
+  `opencode2api_credential_cooldowns_total{reason}` and the separate
+  `opencode2api_credentials{state="ready"}` / `{state="cooling"}` gauges as a leading
   capacity signal. A one-key pool deliberately keeps trying its sole cooled key;
   passthrough publishes no gauge; and a quiet pool retains its last published
   state rather than expiring it on a timer.
-- Alert on sustained `x2api_admission_queue_seconds{endpoint}` p95 above the
+- Alert on sustained `opencode2api_admission_queue_seconds{endpoint}` p95 above the
   deployment's tolerable queue delay, and on
-  `x2api_stream_first_token_seconds{endpoint,format}` p99 for stream latency.
+  `opencode2api_stream_first_token_seconds{endpoint,format}` p99 for stream latency.
   Admission samples include immediate acquisitions, so the full distribution is
   visible; first-token samples exist only for counted streams that relayed a
   frame. The buckets are 50 ms, 250 ms, 1 s, 5 s, and 15 s for admission, and
   50 ms through 3600 s for first-token latency. NDJSON `queued_ms` and `ttfb_ms`
   remain useful per-request correlates.
-- `x2api_requests_total{endpoint,format,status}` and
-  `x2api_streams_total{endpoint,format,result}` provide traffic and outcomes;
-  `x2api_request_duration_seconds{endpoint,stream}` carries real duration
-  buckets. `x2api_tokens_total` and `x2api_media_total` provide cost and
+- `opencode2api_requests_total{endpoint,format,status}` and
+  `opencode2api_streams_total{endpoint,format,result}` provide traffic and outcomes;
+  `opencode2api_request_duration_seconds{endpoint,stream}` carries real duration
+  buckets. `opencode2api_tokens_total` and `opencode2api_media_total` provide cost and
   accepted-media counters.

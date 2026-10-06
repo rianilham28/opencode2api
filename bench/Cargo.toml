@@ -1,5 +1,5 @@
 [package]
-name = "x2api-bench"
+name = "opencode2api-bench"
 description = "Two instruments for the same proxy: an in-process comparative harness (throughput, pace, proxy-thread allocations) and criterion benches decomposing the per-frame fold (dev tool, not shipped with forks)"
 version.workspace = true
 edition.workspace = true
@@ -10,14 +10,14 @@ license.workspace = true
 workspace = true
 
 [[bin]]
-name = "x2api-bench"
+name = "opencode2api-bench"
 path = "src/main.rs"
 
 [dependencies]
-x2api-kit = { workspace = true }
-x2api-transport = { workspace = true }
-x2api-server = { workspace = true }
-x2api-dialects = { workspace = true }
+opencode2api-kit = { workspace = true }
+opencode2api-transport = { workspace = true }
+opencode2api-server = { workspace = true }
+opencode2api-dialects = { workspace = true }
 service = { path = "../crates/service" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
