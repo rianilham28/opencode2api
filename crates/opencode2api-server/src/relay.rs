@@ -133,7 +133,7 @@ impl Sink {
     /// vendor in-band frames untouched; classification applies only here.
     fn fail(&mut self, err: &ProviderError, dst: &mut BytesMut) {
         match self {
-            Self::Compat(s) if err.error_body.is_some() => {
+            Self::Compat(_) if err.error_body.is_some() => {
                 let frame = serde_json::json!({
                     "id": Value::Null,
                     "object": "chat.completion.chunk",
