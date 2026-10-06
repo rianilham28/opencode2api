@@ -5,7 +5,7 @@ members = ["crates/*", "bench"]
 [workspace.package]
 license = "MIT"
 
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # The floor is what the graph resolves at, not what the code was first written
 # against: 1.85 was a historical accident while `askama@0.16` and the `icu_*`
