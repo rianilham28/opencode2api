@@ -4,6 +4,7 @@ config.local.json
 *.local.json
 *.log
 .env
+.envrc
 
 # transient research scratch (durable reports live in docs/)
 /local/
