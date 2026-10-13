@@ -2171,9 +2171,11 @@ async fn a_dead_pool_renders_503_with_retry_after() {
 /// src-side seam would be the alternative; see the report.)
 #[tokio::test]
 async fn an_upstream_429_and_500_leave_the_lane_in_rotation() {
-    // The server retries a retryable status up to `max_attempts` (3), so each
-    // scripted status occupies three consecutive script slots. Indexed by
-    // request, not by connection: this lane's socket is pooled and reused.
+    // The server retries a retryable status up to `max_attempts` (3), so the
+    // 429 occupies three consecutive script slots; a 500 is also re-sent in
+    // place twice per attempt (transient vendor error), so it occupies nine.
+    // Indexed by request, not by connection: this lane's socket is pooled
+    // and reused.
     const RATE_LIMITED: (u16, &str) = (429, "{\"error\":{\"message\":\"slow down\"}}");
     const BROKEN: (u16, &str) = (500, "{\"error\":{\"message\":\"vendor exploded\"}}");
     let (proxy_mock, state) = mock_upstream(vec![Reply::KeepAliveScript(&[
@@ -2181,6 +2183,12 @@ async fn an_upstream_429_and_500_leave_the_lane_in_rotation() {
         RATE_LIMITED,
         RATE_LIMITED,
         RATE_LIMITED,
+        BROKEN,
+        BROKEN,
+        BROKEN,
+        BROKEN,
+        BROKEN,
+        BROKEN,
         BROKEN,
         BROKEN,
         BROKEN,
@@ -2239,6 +2247,61 @@ async fn an_upstream_429_and_500_leave_the_lane_in_rotation() {
     assert!(
         format!("{lane:?}").contains("healthy: true"),
         "a vendor status must not pull a working lane out of rotation: {lane:?}"
+    );
+}
+
+/// A transient vendor error (a 5xx, the endpoint-level 429 "Endpoint is
+/// unavailable") is re-sent in place even with the server's own retry off —
+/// how a balancer in front runs this proxy — while the egress IP's quota 429
+/// goes straight back, for the balancer to fail over to another IP.
+#[tokio::test]
+async fn a_transient_vendor_error_is_resent_in_place_but_quota_is_not() {
+    const UNAVAILABLE: (u16, &str) = (503, "{\"error\":{\"message\":\"overloaded\"}}");
+    const ENDPOINT: (u16, &str) = (
+        429,
+        "{\"error\":{\"message\":\"Upstream request failed: Endpoint is unavailable.\",\"type\":\"server_error\"}}",
+    );
+    const QUOTA: (u16, &str) = (
+        429,
+        "{\"error\":{\"message\":\"Rate limit exceeded. Please try again later.\",\"type\":\"FreeUsageLimitError\"}}",
+    );
+    let (mock, state) = mock_upstream(vec![Reply::KeepAliveScript(&[
+        UNAVAILABLE,
+        ENDPOINT,
+        (200, BUFFERED),
+        QUOTA,
+        (200, BUFFERED),
+    ])])
+    .await;
+    let (mut server, provider) = cfg_for(&format!("http://{}", mock.0));
+    server.retry.max_attempts = 1;
+    let addr = serve(Pipeline::new(
+        Arc::new(OpenAiProvider::new(client_for(&server), provider).unwrap()),
+        Arc::new(server),
+        None,
+    ))
+    .await;
+
+    let recovered = send_chat(addr).await;
+    assert_eq!(
+        recovered.status(),
+        200,
+        "re-sent past a 503 and an endpoint 429"
+    );
+    let _ = recovered.text().await;
+    assert_eq!(state.requests.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+    let quota = send_chat(addr).await;
+    assert_eq!(
+        quota.status(),
+        429,
+        "the quota is the balancer's to fail over"
+    );
+    let _ = quota.text().await;
+    assert_eq!(
+        state.requests.load(std::sync::atomic::Ordering::SeqCst),
+        4,
+        "never re-sent in place"
     );
 }
 

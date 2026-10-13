@@ -1131,7 +1131,12 @@ impl OpenAiProvider {
         Value::Object(map)
     }
 
-    /// Send + status-gate. Everything after a handoff can only fail
+    /// Send + status-gate, re-sending in place while the vendor answers
+    /// with a transient error ([`transient_vendor_error`]) — a short pause on
+    /// the same egress IP clears most of them, and a balancer in front
+    /// running this proxy with `retry.max_attempts: 1` (so quota and
+    /// throttle 429s go straight back to it for failover) otherwise relays
+    /// every one to its clients. Everything after a handoff can only fail
     /// in-stream (Provider trait contract: the retry unit ends at handoff).
     async fn send(
         &self,
@@ -1139,7 +1144,36 @@ impl OpenAiProvider {
         body: Value,
         ctx: &CallContext<'_>,
     ) -> Result<(UpstreamResponse, TouchOnDrop), ProviderError> {
-        let lane = self.transport.lane()?;
+        let mut pauses = VENDOR_RETRY_PAUSES.iter();
+        loop {
+            match self.send_once(url.clone(), &body, ctx).await {
+                Ok(sent) => return Ok(sent),
+                Err((error, true)) if transient_vendor_error(&error) => match pauses.next() {
+                    Some(pause) => {
+                        tracing::warn!(
+                            request_id = ctx.request_id,
+                            status = error.status,
+                            delay_ms = pause.as_millis() as u64,
+                            "transient vendor error; re-sending in place"
+                        );
+                        tokio::time::sleep(*pause).await;
+                    }
+                    None => return Err(error),
+                },
+                Err((error, _)) => return Err(error),
+            }
+        }
+    }
+
+    /// One send + status-gate. A failure says whether the VENDOR answered
+    /// it (`true`) or it never got that far (lane, credential, transport).
+    async fn send_once(
+        &self,
+        url: reqwest::Url,
+        body: &Value,
+        ctx: &CallContext<'_>,
+    ) -> Result<(UpstreamResponse, TouchOnDrop), (ProviderError, bool)> {
+        let lane = self.transport.lane().map_err(|e| (e, false))?;
         lane.begin_use();
         let mut touch = TouchOnDrop {
             lane,
@@ -1150,13 +1184,15 @@ impl OpenAiProvider {
             .lane
             .client()
             .post(url)
-            .json(&body)
+            .json(body)
             // The gate does not read Accept (`*/*` and `application/json`
             // both pass), so one value serves the buffered and streaming
             // paths instead of a per-mode choice. `from_static` validates
             // nothing at request time.
             .header(header::ACCEPT, http::HeaderValue::from_static("*/*"));
-        let (req, slot) = self.decorate(req, ctx.client_authorization(), ctx)?;
+        let (req, slot) = self
+            .decorate(req, ctx.client_authorization(), ctx)
+            .map_err(|e| (e, false))?;
         let resp = match req.send().await {
             Ok(resp) => resp,
             // Only transport-shaped failures are the lane's fault. An
@@ -1175,7 +1211,7 @@ impl OpenAiProvider {
                     opencode2api_transport::SendFault::Slow => touch.lane.note_slow(),
                     opencode2api_transport::SendFault::Other => {}
                 }
-                return Err(ProviderError::from(e));
+                return Err((ProviderError::from(e), false));
             }
         };
         // A working tunnel proves lane health at handoff; idle use remains
@@ -1234,9 +1270,32 @@ impl OpenAiProvider {
                     // A complete rejected body proves the tunnel reached EOF.
                     touch.complete();
                 }
-                Err(error)
+                Err((error, true))
             }
         }
+    }
+}
+
+/// Pauses before each in-place re-send of a transient vendor error: two
+/// more tries, ~2 s at most on top of the sends themselves.
+const VENDOR_RETRY_PAUSES: [Duration; 2] =
+    [Duration::from_millis(500), Duration::from_millis(1500)];
+
+/// A vendor answer worth re-sending from this same egress after a pause: a
+/// 5xx (capacity, a flaky endpoint) or the endpoint-level 429 "Upstream
+/// request failed: Endpoint is unavailable." — measured 2026-10-13 on
+/// step-5-preview-free, which answered ~90% of requests minute by minute
+/// around these. NOT the IP's quota (`FreeUsageLimitError`) nor a token
+/// throttle (`rate_limit_exceeded`): those want another egress IP, which
+/// only a balancer in front can give.
+fn transient_vendor_error(error: &ProviderError) -> bool {
+    match error.status {
+        500 | 502 | 503 | 504 => true,
+        429 => error
+            .error_body
+            .as_ref()
+            .is_some_and(|body| body.to_string().contains("Endpoint is unavailable")),
+        _ => false,
     }
 }
 

@@ -289,6 +289,13 @@ per-slot cooldown, counts by state), the policy is not (`provider.rs` decides
 which statuses spend a key, for how long, and how far a vendor's `Retry-After`
 is trusted before being clamped).
 
+A transient vendor answer — a 5xx, or the endpoint-level 429 "Upstream request
+failed: Endpoint is unavailable." — is re-sent in place by the provider, twice
+(0.5 s then 1.5 s pauses), independent of `retry.max_attempts`: a balancer in
+front can run this proxy with `max_attempts: 1` so the egress IP's quota 429
+(`FreeUsageLimitError`) and token throttles come straight back for failover to
+another IP, without relaying every transient blip to its clients.
+
 ## Vendor specials — where each quirk lives
 
 The compliance docs surfaced real, live-behavior quirks. The rule beats the
