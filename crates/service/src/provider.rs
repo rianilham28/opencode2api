@@ -334,7 +334,9 @@ struct OpenCodeProfile {
 /// The 2.x agent-string shape. NOT a free choice: upstream's free-tier gate
 /// pairs the agent version with an exact tools-body fingerprint (verified
 /// 2026-10-14: the 2.0.27 tool array is accepted only under UA 2.0.27, and
-/// 2.0.18/2.0.29 under the same array are 403'd with FreeTierError). The
+/// 2.0.18/2.0.29 under the same array are 403'd with FreeTierError; on
+/// 2026-10-15 a direct call with UA 2.0.29 over the same array passed, so
+/// the pairing is not stable either way). The
 /// string therefore moves ONLY with a re-captured fingerprint in
 /// `fingerprint/opencode-*.json` — [GATE_TOOLS_JSON] carries the matching
 /// version. Chasing the published release here would silently break the
@@ -392,58 +394,13 @@ fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// A `ses_` id read from the genuine client's local database. The gate keeps
-/// upstream-side state per session: a correctly-shaped fresh mint is 403'd
-/// (verified 2026-10-14), while any id the client itself has EVER used passes
-/// — including long-expired ones. The local opencode db is therefore the
-/// credential source: sessions are collected in file order and the LAST match
-/// wins, which trails the writes the client makes at runtime (it appends).
-fn harvest_opencode_session() -> Option<http::HeaderValue> {
-    const NEEDED: usize = 4 + 26; // "ses_" + 26 id characters
-    fn is_id_byte(b: u8) -> bool {
-        b.is_ascii_alphanumeric()
-    }
-    let mut path = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
-    path.push(".local/share/opencode/opencode.db");
-    let file = std::fs::File::open(&path).ok()?;
-    let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
-    let mut last: Option<Vec<u8>> = None;
-    // CHUNK + OVERLAP: a match may straddle a chunk boundary, so each pass
-    // re-scans the last NEEDED-1 bytes before the fresh ones.
-    const CHUNK: usize = 1 << 20;
-    const OVERLAP: usize = 4 + 4 + 26; // literal + worst-case partial prefix
-    let mut buf: Vec<u8> = Vec::with_capacity(CHUNK + OVERLAP);
-    loop {
-        use std::io::Read;
-        let start = buf.len().saturating_sub(OVERLAP);
-        buf.drain(..start);
-        let grown = reader.by_ref().take(CHUNK as u64).read_to_end(&mut buf);
-        if grown.is_err() || buf.is_empty() {
-            break;
-        }
-        let mut i = 0;
-        while i + NEEDED <= buf.len() {
-            if &buf[i..i + 4] == b"ses_" {
-                let id = &buf[i..i + NEEDED]; // the literal rides with it
-                if id[4..].iter().copied().all(is_id_byte) {
-                    last = Some(id.to_vec());
-                }
-                i += 4;
-            } else {
-                i += 1;
-            }
-        }
-        if grown.as_ref().is_ok_and(|n| *n < CHUNK) {
-            break;
-        }
-    }
-    let id = last?;
-    http::HeaderValue::from_bytes(&id).ok()
-}
-
 /// The session id, in the exact shape the gate's regex accepts:
 /// `ses_` + 12 hex + 14 base62. The ordered half is INVERTED, which is how
 /// opencode mints sessions — the newest sorts first among its siblings.
+/// The gate reads that clock but keeps no session registry (verified
+/// 2026-10-15 by direct calls): an id minted here passes fresh, reused,
+/// 30 days old or minutes ahead, while random hex or the clock NOT inverted
+/// is 403'd — so no genuine client's session is ever needed.
 fn mint_opencode_session() -> http::HeaderValue {
     const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     const MASK: u64 = 0xFFFF_FFFF_FFFF;
@@ -650,14 +607,7 @@ impl OpenAiProvider {
         let chat_url = parse_endpoint(&base, "chat/completions")?;
         let responses_url = parse_endpoint(&base, "responses")?;
         let models_url = parse_endpoint(&base, "models")?;
-        let session = harvest_opencode_session().unwrap_or_else(|| {
-            tracing::warn!(
-                "no genuine opencode session found in the local client's database; \
-                 minting one — the free-tier gate will refuse it until a real \
-                 client registers a session upstream"
-            );
-            mint_opencode_session()
-        });
+        let session = mint_opencode_session();
         let opencode = OpenCodeProfile {
             client: http::HeaderValue::from_static("cli"),
             project: mint_opencode_project(),
@@ -2875,15 +2825,25 @@ mod tests {
                 "{absent} is not part of the 2.x profile"
             );
         }
-        // The session is HARVESTED from the genuine client's db, so a second
-        // provider in the same process reuses the SAME one — one real opencode
-        // session behind every lane is the point. The project stays minted per
-        // construction.
+        // The gate reads the session's clock half, INVERTED as opencode mints
+        // it: a non-inverted or random one is refused (verified 2026-10-15).
+        let ordered = !u64::from_str_radix(&tail[..12], 16).expect("hex") & 0xFFFF_FFFF_FFFF;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        let minted_ms = ordered >> 12;
+        let now_low = now_ms & (0xFFFF_FFFF_FFFF >> 12);
+        assert!(
+            now_low.abs_diff(minted_ms) < 60_000,
+            "the clock half decodes to now: {session}"
+        );
+        // Session and project are minted per construction: no genuine
+        // client's session is borrowed.
         let second = decorated(&zen_provider());
-        assert_eq!(
+        assert_ne!(
             second.headers().get("x-opencode-session"),
-            h.get("x-opencode-session"),
-            "both providers borrow the one genuine session"
+            h.get("x-opencode-session")
         );
         assert_ne!(
             second.headers().get("x-opencode-project"),
