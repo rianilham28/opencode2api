@@ -1155,7 +1155,7 @@ pub fn models_page(
             ids()?
                 .into_iter()
                 .find(|id| *id == bare)
-                .map(&resource)
+                .map(resource)
                 .ok_or_else(|| {
                     ProviderError::not_found(format!(
                         "model \"{name}\" is not in this proxy's catalogue"

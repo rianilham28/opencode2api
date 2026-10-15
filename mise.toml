@@ -18,7 +18,7 @@ min_version = "2026.7.0"
 
 [tools]
 # Keep equal to `channel` in rust-toolchain.toml.
-rust = "1.98.0"
+rust = "stable"
 # Keep equal to `min_hk_version` and the `package://` release in hk.pkl: a
 # floating hk binary would let a new release redefine a builtin default and
 # silently change what the gate accepts.

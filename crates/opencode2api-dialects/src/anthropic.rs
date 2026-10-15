@@ -187,14 +187,12 @@ impl AnthropicRequest {
         // silently changing which upstream the request suits. Refusing is
         // honest; forwarding it unmapped would be a no-op the client believes
         // took effect.
-        for key in ["thinking"] {
-            if self.extra.contains_key(key) {
-                return Err(ProviderError::bad_request(format!(
-                    "{key} requests reasoning from the upstream, which the chat wire spells \
-                     per vendor and this bridge cannot translate without choosing a vendor \
-                     (set it in the provider crate, or send it on the chat dialect)"
-                )));
-            }
+        if self.extra.contains_key("thinking") {
+            return Err(ProviderError::bad_request(
+                "thinking requests reasoning from the upstream, which the chat wire spells \
+                 per vendor and this bridge cannot translate without choosing a vendor \
+                 (set it in the provider crate, or send it on the chat dialect)",
+            ));
         }
 
         let mut messages = Vec::with_capacity(self.messages.len() + 1);

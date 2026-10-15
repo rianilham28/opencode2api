@@ -715,6 +715,9 @@ impl Lane {
     }
 
     /// Mark a handed-off lane complete before recording its outcome.
+    // `fetch_update` is deprecated on stable in favour of `try_update`, which
+    // is newer than the 1.88 MSRV; the old name stays until the MSRV moves.
+    #[allow(deprecated)]
     pub fn end_use(&self) {
         // Saturating, not wrapping: an unbalanced end_use must not resurrect
         // a permanently in-flight counter and freeze the lane out of idle
