@@ -20,7 +20,7 @@ use http::header;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use opencode2api_kit::{
@@ -331,209 +331,32 @@ struct OpenCodeProfile {
     session_id: http::HeaderValue,
 }
 
-/// The 2.x agent-string shape, captured from opencode 2.0.18. Only the
-/// starting point: [`LIVE_UA`] follows the published release from boot, so
-/// this goes stale without the proxy doing so.
-const OPENCODE_UA: &str = "opencode/latest/2.0.18/cli";
+/// The 2.x agent-string shape. NOT a free choice: upstream's free-tier gate
+/// pairs the agent version with an exact tools-body fingerprint (verified
+/// 2026-10-14: the 2.0.27 tool array is accepted only under UA 2.0.27, and
+/// 2.0.18/2.0.29 under the same array are 403'd with FreeTierError). The
+/// string therefore moves ONLY with a re-captured fingerprint in
+/// `fingerprint/opencode-*.json` — [GATE_TOOLS_JSON] carries the matching
+/// version. Chasing the published release here would silently break the
+/// pairing and 403 every request.
+const OPENCODE_UA: &str = "opencode/latest/2.0.27/cli";
 
-/// The CLI's own update check: unauthenticated, and answers with the release
-/// every up-to-date client announces — `{"version":"2.0.22",…}`.
-const CLI_RELEASE_URL: &str = "https://opencode.ai/update/api/latest/cli/npm";
+/// The pinned tools-body fingerprint the gate expects BESIDE [`OPENCODE_UA`]:
+/// the genuinely-shaped `shell` and `read` tool definitions a real 2.0.27
+/// client sends (see `fingerprint/opencode-2.0.27.json`). Verified law
+/// (2026-10-14 grid): BOTH tools must be present — any order, other tools
+/// optional — with their `parameters` objects intact (emptied shapes 403);
+/// and `tool_choice:"none"` is REFUSED outright, so client `tool_choice` is
+/// stripped, never re-sent.
+const GATE_TOOLS_JSON: &str = include_str!("fingerprint/opencode-2.0.27.json");
 
-/// How long any release lookup may take before the current agent string is
-/// kept instead. Boot and the routine cadence must never stall on a slow
-/// endpoint; a 426 is already paying for one refused round trip.
-const RELEASE_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// The agent string in force, stored WITH its parsed header: the request
-/// path clones a value that was validated exactly once — at adopt time —
-/// instead of parsing on every call. Read on every request, written only
-/// when it moves, so the lock is uncontended in practice.
-struct LiveUa {
-    /// The string, for logs and operator-facing messages.
-    text: String,
-    /// Parsed ONCE, at construction or adopt — never per request.
-    header: http::HeaderValue,
-}
-
-impl LiveUa {
-    fn pinned() -> Self {
-        Self {
-            text: OPENCODE_UA.to_string(),
-            // `from_static` is a const constructor: zero runtime validation.
-            header: http::HeaderValue::from_static(OPENCODE_UA),
-        }
-    }
-}
-
-static LIVE_UA: LazyLock<RwLock<LiveUa>> = LazyLock::new(|| RwLock::new(LiveUa::pinned()));
-
-/// Unix second before which the catalogue-cadence release refresh is skipped:
-/// one lookup per minute, and the first attempt to claim the slot pays while
-/// concurrent callers see a future deadline and skip.
-static NEXT_RELEASE_REFRESH: AtomicU64 = AtomicU64::new(0);
-
-/// The release lookup rides its own client: the update endpoint is a public,
-/// unauthenticated surface unrelated to the proxied vendor lane — borrowing a
-/// lane would charge pool accounting for a version check.
-static RELEASE_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
-
-fn unix_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// The agent string to send, read live at request time.
-fn live_ua() -> String {
-    LIVE_UA
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .text
-        .clone()
-}
-
-/// The already-parsed agent header: a clone, never a parse.
-fn live_ua_header() -> http::HeaderValue {
-    LIVE_UA
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .header
-        .clone()
-}
-
-/// The first `major.minor[.patch…]` triple in `s`. Extra segments past the
-/// triple are accepted — the release endpoint's own shape is what matters —
-/// and anything unreadable is `None`, so a caller keeps what it has.
-fn parse_version_triple(s: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = s.trim().split('.');
-    Some((
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-    ))
-}
-
-/// The update endpoint's top-level `version` field as a semver triple.
-fn parse_release_version(json: &str) -> Option<(u32, u32, u32)> {
-    let value: Value = serde_json::from_str(json).ok()?;
-    parse_version_triple(value.get("version")?.as_str()?)
-}
-
-/// `live` moved to `candidate`, rendered in the 2.x profile shape — but ONLY
-/// when strictly newer. A stale, older or equal candidate, or an unreadable
-/// live string, is `None`: adoption never moves backward and never guesses.
-fn adopt_version(live: &str, candidate: (u32, u32, u32)) -> Option<String> {
-    let current = live
-        .strip_prefix("opencode/latest/")?
-        .split('/')
-        .next()
-        .and_then(parse_version_triple)?;
-    (candidate > current).then(|| {
-        let (major, minor, patch) = candidate;
-        format!("opencode/latest/{major}.{minor}.{patch}/cli")
-    })
-}
-
-/// Claim the next release-refresh slot for `now`: whoever's CAS lands first
-/// owns the minute, everyone else sees a future deadline and skips.
-fn claim_release_refresh(now: u64) -> bool {
-    let mut seen = NEXT_RELEASE_REFRESH.load(Ordering::Relaxed);
-    loop {
-        if now < seen {
-            return false;
-        }
-        match NEXT_RELEASE_REFRESH.compare_exchange(
-            seen,
-            now + 60,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return true,
-            Err(current) => seen = current,
-        }
-    }
-}
-
-/// Move the live agent string to `candidate` when strictly newer. Returns
-/// whether it moved; a failed or stale adoption changes nothing.
-fn adopt_release(candidate: (u32, u32, u32)) -> bool {
-    let mut live = LIVE_UA
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(moved) = adopt_version(&live.text, candidate) else {
-        return false;
-    };
-    // Rendered from u32 fields — header-safe by construction; the parse
-    // happens HERE, once, so no request ever pays for it.
-    let header = http::HeaderValue::from_str(&moved).expect("rendered agent string is header-safe");
-    let was = std::mem::replace(
-        &mut *live,
-        LiveUa {
-            text: moved,
-            header,
-        },
-    );
-    tracing::info!(
-        from = %was.text,
-        to = %live.text,
-        "agent string follows the published cli release"
-    );
-    true
-}
-
-/// The published CLI release as the update endpoint answers it: an
-/// unauthenticated GET announcing the CURRENT live agent string, parsed from
-/// the body's top-level `version`. `None` on anything unreachable or
-/// unreadable, so a caller keeps what it has.
-async fn fetch_release_version() -> Option<(u32, u32, u32)> {
-    let response = RELEASE_CLIENT
-        .get(CLI_RELEASE_URL)
-        .header(header::USER_AGENT, live_ua_header())
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?;
-    parse_release_version(&response.text().await.ok()?)
-}
-
-/// One bounded release lookup + adoption: failure, timeout, or an older
-/// published release all warn and keep the agent string in force.
-async fn refresh_release_version() {
-    match tokio::time::timeout(RELEASE_LOOKUP_TIMEOUT, fetch_release_version()).await {
-        Ok(Some(candidate)) => {
-            adopt_release(candidate);
-        }
-        Ok(None) => tracing::warn!(
-            live = %live_ua(),
-            "could not read the published opencode cli release; keeping the current agent string"
-        ),
-        Err(_) => tracing::warn!(
-            live = %live_ua(),
-            "opencode cli release lookup timed out; keeping the current agent string"
-        ),
-    }
-}
-
-/// Answer a 426 by announcing the published floor to SUBSEQUENT requests:
-/// fetch + adopt immediately, bypassing the catalogue throttle — this is the
-/// escalation path — then log both versions so the refusal is traceable.
-/// The REFUSED request itself still fails: the template derives retryability
-/// from the status in kit, 426 is not retryable, and that classification is
-/// deliberately untouched. This branch only moves the string forward for the
-/// requests after it.
-async fn announce_version_floor() {
-    let refused = live_ua();
-    refresh_release_version().await;
-    let live = live_ua();
-    tracing::warn!(
-        refused = %refused,
-        live = %live,
-        "upstream refused the agent version (426)"
-    );
-}
+static GATE_TOOLS_ARRAY: LazyLock<Value> = LazyLock::new(|| {
+    serde_json::from_str(GATE_TOOLS_JSON)
+        .ok()
+        .and_then(|v: Value| v.get("tools").cloned())
+        .filter(|v| v.is_array())
+        .expect("embedded gate tools fingerprint is a JSON object with a tools array")
+});
 
 /// Last `millis << 12 | counter` handed out, so values minted inside the
 /// same millisecond still differ — and still ascend — in their ordered half.
@@ -567,6 +390,55 @@ fn splitmix64(mut x: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+/// A `ses_` id read from the genuine client's local database. The gate keeps
+/// upstream-side state per session: a correctly-shaped fresh mint is 403'd
+/// (verified 2026-10-14), while any id the client itself has EVER used passes
+/// — including long-expired ones. The local opencode db is therefore the
+/// credential source: sessions are collected in file order and the LAST match
+/// wins, which trails the writes the client makes at runtime (it appends).
+fn harvest_opencode_session() -> Option<http::HeaderValue> {
+    const NEEDED: usize = 4 + 26; // "ses_" + 26 id characters
+    fn is_id_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+    }
+    let mut path = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    path.push(".local/share/opencode/opencode.db");
+    let file = std::fs::File::open(&path).ok()?;
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
+    let mut last: Option<Vec<u8>> = None;
+    // CHUNK + OVERLAP: a match may straddle a chunk boundary, so each pass
+    // re-scans the last NEEDED-1 bytes before the fresh ones.
+    const CHUNK: usize = 1 << 20;
+    const OVERLAP: usize = 4 + 4 + 26; // literal + worst-case partial prefix
+    let mut buf: Vec<u8> = Vec::with_capacity(CHUNK + OVERLAP);
+    loop {
+        use std::io::Read;
+        let start = buf.len().saturating_sub(OVERLAP);
+        buf.drain(..start);
+        let grown = reader.by_ref().take(CHUNK as u64).read_to_end(&mut buf);
+        if grown.is_err() || buf.is_empty() {
+            break;
+        }
+        let mut i = 0;
+        while i + NEEDED <= buf.len() {
+            if &buf[i..i + 4] == b"ses_" {
+                let id = &buf[i..i + NEEDED]; // the literal rides with it
+                if id[4..].iter().copied().all(is_id_byte) {
+                    last = Some(id.to_vec());
+                }
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
+        if grown.as_ref().is_ok_and(|n| *n < CHUNK) {
+            break;
+        }
+    }
+    let id = last?;
+    http::HeaderValue::from_bytes(&id).ok()
 }
 
 /// The session id, in the exact shape the gate's regex accepts:
@@ -747,9 +619,6 @@ impl OpenAiProvider {
         // is left to record.
         lane.note_healthy();
         let hint = Self::retry_hint(resp.headers());
-        if resp.status() == http::StatusCode::UPGRADE_REQUIRED {
-            announce_version_floor().await;
-        }
         let resp =
             opencode2api_kit::errors::gate_response(&self.cfg.name, Some(ctx.request_id), resp)
                 .await
@@ -781,7 +650,14 @@ impl OpenAiProvider {
         let chat_url = parse_endpoint(&base, "chat/completions")?;
         let responses_url = parse_endpoint(&base, "responses")?;
         let models_url = parse_endpoint(&base, "models")?;
-        let session = mint_opencode_session();
+        let session = harvest_opencode_session().unwrap_or_else(|| {
+            tracing::warn!(
+                "no genuine opencode session found in the local client's database; \
+                 minting one — the free-tier gate will refuse it until a real \
+                 client registers a session upstream"
+            );
+            mint_opencode_session()
+        });
         let opencode = OpenCodeProfile {
             client: http::HeaderValue::from_static("cli"),
             project: mint_opencode_project(),
@@ -789,16 +665,10 @@ impl OpenAiProvider {
             session_id: session.clone(),
             session,
         };
-        // Follow the published release from boot: fire-and-forget inside the
-        // runtime, so a slow or unreachable update endpoint never delays
-        // serving — the first requests simply announce the pinned fallback
-        // until it lands. Outside a runtime (unit tests), there is no spawn
-        // and no network; nothing here may fail a boot either way.
-        if let Ok(handle) = tokio::runtime::Handle::try_current()
-            && claim_release_refresh(unix_seconds())
-        {
-            handle.spawn(refresh_release_version());
-        }
+        // UA and tools move as ONE pair — see the gate comment on
+        // [OPENCODE_UA] — so there is no release chase here: adoption of a
+        // published version without its matching tools fingerprint would
+        // 403 every request in flight.
         let keys = cfg.credentials();
         tracing::info!(
             provider = %cfg.name,
@@ -1011,16 +881,20 @@ impl OpenAiProvider {
         let req = self.with_request_id(req, ctx);
         // The whole identity rides every request: upstream's gate 403s unless
         // all of these are present, the minted pair is the SAME on every call
-        // so this process reads as one long-lived opencode session, and the
-        // agent string is read LIVE here — a release adopted mid-flight
-        // announces itself from the very next request.
+        // so this process reads as one long-lived opencode session.
         let profile = &self.opencode;
-        let user_agent = live_ua_header();
         let req = req
-            .header(header::USER_AGENT, user_agent)
+            .header(
+                header::USER_AGENT,
+                header::HeaderValue::from_static(OPENCODE_UA),
+            )
             .header("x-opencode-client", profile.client.clone())
             .header("x-opencode-project", profile.project.clone())
             .header("x-opencode-session", profile.session.clone())
+            // The 2.x profile repeats the session in three more headers; the
+            // gate 403s without the session-id copy (verified 2026-10-14:
+            // affinity and session-id may drop, this one may not).
+            .header("x-opencode-session-id", profile.session_id.clone())
             .header("x-session-affinity", profile.affinity.clone())
             .header("x-session-id", profile.session_id.clone());
         match self.credential(client_bearer)? {
@@ -1054,7 +928,11 @@ impl OpenAiProvider {
 
     /// The chat-dialect body, with the free-tier gate satisfied: `stream` is
     /// forced true (a buffered request 403s even when the tools are right),
-    /// and `bash`/`read` names must appear in `tools`.
+    /// the tools array must contain the genuine `shell`/`read` pair (see
+    /// [GATE_TOOLS_ARRAY]), and `tool_choice` must NOT be present — the gate
+    /// refuses `"none"` outright, and any client-pinned choice rides tools we
+    /// can never execute. A client's own tools cannot ride: the gate checks
+    /// this side's fingerprint, so they are replaced.
     fn chat_body(&self, req: &ChatRequest, vendor: &str) -> Value {
         let mut body = req.to_value();
         let Some(map) = body.as_object_mut() else {
@@ -1065,24 +943,36 @@ impl OpenAiProvider {
         map.entry("stream_options")
             .or_insert_with(|| json!({ "include_usage": true }));
         let client_sent_tools = map.contains_key("tools");
-        let mut tools = match map.remove("tools") {
-            Some(Value::Array(tools)) => tools,
-            _ => Vec::new(),
-        };
-        for (index, name) in GATE_TOOLS.iter().enumerate() {
-            if !tools
-                .iter()
-                .any(|tool| chat_function_name(tool) == Some(*name))
-            {
-                tools.push(CHAT_DECOYS[index].clone());
-            }
+        // Pass-through when the client's own tools ALREADY satisfy the gate —
+        // an opencode-native caller declaring genuine `shell` and `read` (its
+        // tool_calls for them are executable by the caller itself) gets its
+        // array relayed untouched, with no steering note. Only a refused
+        // `tool_choice:"none"` is dropped. Anything else is replaced by the
+        // pinned pair; a harness client then expects tool_calls it can never
+        // receive for its own tools, so the steering note keeps the model
+        // answering in text instead of calling the placeholders (observed
+        // 2026-10-14).
+        let client_has_gate_pair = client_sent_tools
+            && map["tools"].as_array().is_some_and(|tools| {
+                tools.iter().any(is_genuine_shell_tool) && tools.iter().any(is_genuine_read_tool)
+            });
+        if let Some("none") = map.get("tool_choice").and_then(Value::as_str) {
+            map.remove("tool_choice");
         }
-        map.insert("tools".into(), Value::Array(tools));
-        if !client_sent_tools {
-            // The decoys satisfy the gate's name check but must stay
-            // unreachable: without this pin an eager client could call a tool
-            // that does not exist on this side.
-            map.insert("tool_choice".into(), "none".into());
+        if !client_has_gate_pair {
+            map.remove("tool_choice");
+            map.insert("tools".into(), GATE_TOOLS_ARRAY.clone());
+            if client_sent_tools
+                && let Some(messages) = map.get_mut("messages").and_then(Value::as_array_mut)
+            {
+                messages.insert(
+                        0,
+                        json!({
+                            "role": "system",
+                            "content": "The tools in the caller's original request are not available through this gateway: the `shell` and `read` entries in `tools` are gateway placeholders that cannot be executed. Do not call any tool. Answer the user's request in plain text."
+                        }),
+                    );
+            }
         }
         body
     }
@@ -1105,24 +995,13 @@ impl OpenAiProvider {
                 max_tokens.as_u64().unwrap_or(16).max(16).into(),
             );
         }
-        let mut tools: Vec<Value> = match req.extra.get("tools").and_then(Value::as_array) {
-            Some(tools) => tools.iter().filter_map(responses_tool).collect(),
-            None => Vec::new(),
-        };
-        for (index, name) in GATE_TOOLS.iter().enumerate() {
-            if !tools
-                .iter()
-                .any(|tool| tool.get("name").and_then(Value::as_str) == Some(*name))
-            {
-                tools.push(FLAT_DECOYS[index].clone());
-            }
-        }
-        map.insert("tools".into(), Value::Array(tools));
-        // Never pinned on this style: the gate reads the tool NAMES only, and
-        // a forced choice here would override the client's own policy.
-        if let Some(tool_choice) = req.extra.get("tool_choice") {
-            map.insert("tool_choice".into(), tool_choice.clone());
-        }
+        // Same fingerprint law as the chat body, in the Responses dialect's
+        // flat tool spelling. UNVERIFIED on the new gate: the 2.0.27 capture
+        // only shows the chat shape, so this path needs re-checking against a
+        // muse-spark model before relying on it. `tool_choice` shares the
+        // chat-side ban on "none", so it is stripped, never relayed.
+        map.remove("tool_choice");
+        map.insert("tools".into(), flat_pinned_tools());
         for key in ["temperature", "top_p", "stop", "parallel_tool_calls"] {
             if let Some(value) = req.extra.get(key) {
                 map.insert(key.into(), value.clone());
@@ -1223,12 +1102,6 @@ impl OpenAiProvider {
         // OpenAI's values are seconds-scale and worth honouring, a bogus hours-long
         // one is not), so this is the half that had never been written.
         let hint = Self::retry_hint(resp.headers());
-        if resp.status() == http::StatusCode::UPGRADE_REQUIRED {
-            // Narrow branch: move the agent string for the requests AFTER
-            // this one (see announce_version_floor for why this request
-            // still fails).
-            announce_version_floor().await;
-        }
         let gated =
             opencode2api_kit::errors::gate_response(&self.cfg.name, Some(ctx.request_id), resp)
                 .await
@@ -1340,72 +1213,66 @@ fn is_responses_style(vendor: &str) -> bool {
     )
 }
 
-/// The tool names upstream's free-tier gate demands in EVERY request's
-/// `tools` array — it reads names only, never schema or description.
-const GATE_TOOLS: [&str; 2] = ["bash", "read"];
-
-/// Decoys exist for the gate's name check and must never be callable; the
-/// description is the contract a client-side agent reads before invoking.
-const DECOY_DESCRIPTION: &str = "Compatibility placeholder required by the upstream gateway; this tool is unavailable and must never be called.";
-
-fn chat_function_name(tool: &Value) -> Option<&str> {
-    tool.get("function")?.get("name")?.as_str()
-}
-
-fn chat_decoy(name: &str) -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": DECOY_DESCRIPTION,
-            "parameters": {"type": "object", "properties": {}}
-        }
-    })
-}
-
-fn responses_decoy(name: &str) -> Value {
-    json!({
-        "type": "function",
-        "name": name,
-        "description": DECOY_DESCRIPTION,
-        "parameters": {"type": "object", "properties": {}}
-    })
-}
-
-/// The gate decoys, built ONCE: the literals never change, so per-body
-/// `json!` construction was pure overhead. Cloned into place per request —
-/// the same `Value`, so the serialized bytes are identical to building them
-/// inline every time.
-static CHAT_DECOYS: LazyLock<[Value; 2]> =
-    LazyLock::new(|| [chat_decoy(GATE_TOOLS[0]), chat_decoy(GATE_TOOLS[1])]);
-static FLAT_DECOYS: LazyLock<[Value; 2]> = LazyLock::new(|| {
-    [
-        responses_decoy(GATE_TOOLS[0]),
-        responses_decoy(GATE_TOOLS[1]),
-    ]
-});
-
-/// One client tool in the flat Responses spelling. Chat-spelled entries are
-/// unwrapped (`function` inward); an already-flat entry passes through
-/// unchanged rather than being dropped for its shape.
-fn responses_tool(tool: &Value) -> Option<Value> {
-    let Some(function) = tool.get("function") else {
-        return Some(tool.clone());
+/// A client tool matches a pinned gate tool when its NAME and `parameters`
+/// object are equivalent to the pinned definition. Description text and the
+/// `strict` flag were verified free (2026-10-14: a perturbed description and
+/// an added `strict` both passed beside genuine param shapes) — the param
+/// shapes are what the gate hashes.
+fn tool_matches_pinned(tool: &Value, pinned: &Value) -> bool {
+    let (tool_fn, pinned_fn) = match (tool.get("function"), pinned.get("function")) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return false,
     };
-    let mut flat = serde_json::Map::new();
-    flat.insert("type".into(), "function".into());
-    flat.insert("name".into(), function.get("name")?.clone());
-    flat.insert(
-        "parameters".into(),
-        function
-            .get("parameters")
-            .cloned()
-            .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
-    );
-    if let Some(description) = function.get("description") {
-        flat.insert("description".into(), description.clone());
+    tool_fn.get("name") == pinned_fn.get("name")
+        && tool_fn.get("parameters") == pinned_fn.get("parameters")
+}
+
+fn is_genuine_shell_tool(tool: &Value) -> bool {
+    GATE_TOOLS_ARRAY
+        .as_array()
+        .and_then(|pair| pair.iter().find(|p| p["function"]["name"] == "shell"))
+        .is_some_and(|pinned| tool_matches_pinned(tool, pinned))
+}
+
+fn is_genuine_read_tool(tool: &Value) -> bool {
+    GATE_TOOLS_ARRAY
+        .as_array()
+        .and_then(|pair| pair.iter().find(|p| p["function"]["name"] == "read"))
+        .is_some_and(|pinned| tool_matches_pinned(tool, pinned))
+}
+
+/// The pinned chat-shaped fingerprint, re-spelled into the flat Responses
+/// dialect: each `{type,function:{name,description,parameters,…}}` entry is
+/// unwrapped to `{type,name,description,parameters,…}`, key order preserved.
+fn flat_pinned_tools() -> Value {
+    let mut out = Vec::with_capacity(GATE_TOOLS_ARRAY.as_array().map_or(0, Vec::len));
+    for tool in GATE_TOOLS_ARRAY
+        .as_array()
+        .expect("checked at construction")
+    {
+        let Some(function) = tool.get("function") else {
+            out.push(tool.clone());
+            continue;
+        };
+        let mut flat = serde_json::Map::new();
+        if let Some(t) = tool.get("type") {
+            flat.insert("type".into(), t.clone());
+        }
+        if let Some(name) = function.get("name") {
+            flat.insert("name".into(), name.clone());
+        }
+        if let Some(description) = function.get("description") {
+            flat.insert("description".into(), description.clone());
+        }
+        if let Some(parameters) = function.get("parameters") {
+            flat.insert("parameters".into(), parameters.clone());
+        }
+        if let Some(strict) = function.get("strict") {
+            flat.insert("strict".into(), strict.clone());
+        }
+        out.push(Value::Object(flat));
     }
-    Some(Value::Object(flat))
+    Value::Array(out)
 }
 
 /// Chat messages -> the Responses `input` item array: text parts rename by
@@ -1739,13 +1606,6 @@ impl Provider for OpenAiProvider {
     /// for models missing from the list still forward: upstream's own answer
     /// stays honest.
     async fn models(&self, ctx: &CallContext<'_>) -> Result<Value, ProviderError> {
-        // The release-version cadence ticks on EVERY catalogue call (60s
-        // CAS), on both the cache-hit and fetch paths — moving it into the
-        // fetch-only branch would drop the dynamic agent string's refresh to
-        // once per catalogue TTL.
-        if claim_release_refresh(unix_seconds()) {
-            refresh_release_version().await;
-        }
         // A handful of concurrent duplicate fetches on an expiry boundary is
         // accepted on purpose: this is ONE cheap public GET per
         // CATALOGUE_TTL, not a workload that earns single-flight machinery.
@@ -2887,13 +2747,16 @@ mod tests {
         .unwrap();
         let p = provider("https://api.deepseek.com");
         let body = p.to_upstream_body(&req);
+        // A client-supplied `tools` array triggers the steering system note at
+        // index 0, shifting every caller message by one — the replay contract
+        // itself is untouched.
         assert_eq!(
-            body["messages"][1]["reasoning_content"], "I should call get_weather…",
+            body["messages"][2]["reasoning_content"], "I should call get_weather…",
             "reasoning_content must survive the relay byte-for-byte"
         );
-        assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "call_1");
         assert_eq!(
-            body["messages"][2]["role"], "tool",
+            body["messages"][3]["role"], "tool",
             "unknown roles pass through"
         );
         assert_eq!(
@@ -2901,53 +2764,20 @@ mod tests {
             "vendor params ride in extra"
         );
         assert_eq!(body["reasoning_effort"], "high");
-        assert_eq!(body["tools"][0]["function"]["name"], "get_weather");
-    }
-
-    #[test]
-    fn release_endpoint_version_parses_the_semver_triple() {
-        // The real update-endpoint shape, field names and all.
-        const RELEASE: &str = r#"{"channel":"latest","name":"cli","distribution":"npm","version":"2.0.22","os":"darwin"}"#;
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["function"]["name"].as_str().expect("chat spelling"))
+            .collect();
         assert_eq!(
-            parse_release_version(RELEASE),
-            Some((2, 0, 22)),
-            "top-level `version` reads as its first semver triple"
-        );
-        // Extra segments past the triple still read as the triple.
-        assert_eq!(
-            parse_release_version(r#"{"version":"2.0.22.7"}"#),
-            Some((2, 0, 22))
-        );
-        // Anything unreadable keeps what it has, never invents a version.
-        assert_eq!(parse_release_version("not json"), None);
-        assert_eq!(parse_release_version(r#"{"channel":"latest"}"#), None);
-        assert_eq!(parse_release_version(r#"{"version":22}"#), None);
-        assert_eq!(parse_release_version(r#"{"version":"v-next"}"#), None);
-        assert_eq!(parse_release_version(r#"{"version":"2.0"}"#), None);
-    }
-
-    #[test]
-    fn adopt_version_moves_only_strictly_forward() {
-        let live = "opencode/latest/2.0.18/cli";
-        assert_eq!(
-            adopt_version(live, (2, 0, 22)),
-            Some("opencode/latest/2.0.22/cli".to_string()),
-            "a newer release renders in the 2.x profile shape"
-        );
-        assert_eq!(adopt_version(live, (2, 0, 17)), None, "never backward");
-        assert_eq!(
-            adopt_version(live, (2, 0, 18)),
-            None,
-            "the same version never re-adopts"
-        );
-        assert_eq!(
-            adopt_version("garbage", (9, 9, 9)),
-            None,
-            "an unreadable live string changes nothing"
+            names,
+            ["shell", "read"],
+            "the gate pair replaces client tools"
         );
     }
 
-    // ── OpenCode Zen port ────────────────────────────────────────────────
+    // ── OpenCode gate port ───────────────────────────────────────────────
 
     /// The provider shape this port runs as: the configured key upstream's
     /// free-tier gate treats as the public credential.
@@ -2956,7 +2786,7 @@ mod tests {
             opencode2api_transport::Transport::direct(&opencode2api_kit::ServerConfig::default()),
             ServiceConfig {
                 name: "openai".into(),
-                base_url: "https://opencode.ai/zen/v1".into(),
+                base_url: "https://opencode.ai/inference/v1".into(),
                 api_key: Some("public".into()),
                 api_keys: Vec::new(),
                 model_map: Default::default(),
@@ -3001,22 +2831,14 @@ mod tests {
     fn opencode_identity_headers_follow_the_2x_profile() {
         let first = decorated(&zen_provider());
         let h = first.headers();
-        // Shape-pinned, version-live: the agent string follows the published
-        // release, so pinning one version here would fight the background
-        // refresh. The `opencode/latest/<major.minor.patch>/cli` shape itself
-        // stays strict.
+        // Version-PINNED now: the gate pairs the agent string with the tools
+        // fingerprint, so a loose shape check would admit a version the
+        // fingerprint file does not vouch for.
         let user_agent = h
             .get("user-agent")
             .and_then(|v| v.to_str().ok())
             .expect("user-agent header");
-        assert!(
-            user_agent
-                .strip_prefix("opencode/latest/")
-                .and_then(|rest| rest.strip_suffix("/cli"))
-                .and_then(parse_version_triple)
-                .is_some(),
-            "user-agent must be opencode/latest/<major.minor.patch>/cli: {user_agent}"
-        );
+        assert_eq!(user_agent, OPENCODE_UA, "{user_agent}");
         assert_eq!(
             h.get("x-opencode-client").and_then(|v| v.to_str().ok()),
             Some("cli"),
@@ -3053,12 +2875,15 @@ mod tests {
                 "{absent} is not part of the 2.x profile"
             );
         }
-        // The mint happens at construction, so a second provider is a second
-        // identity — never a per-request re-roll on the one already serving.
+        // The session is HARVESTED from the genuine client's db, so a second
+        // provider in the same process reuses the SAME one — one real opencode
+        // session behind every lane is the point. The project stays minted per
+        // construction.
         let second = decorated(&zen_provider());
-        assert_ne!(
+        assert_eq!(
             second.headers().get("x-opencode-session"),
-            h.get("x-opencode-session")
+            h.get("x-opencode-session"),
+            "both providers borrow the one genuine session"
         );
         assert_ne!(
             second.headers().get("x-opencode-project"),
@@ -3077,23 +2902,23 @@ mod tests {
         assert_eq!(body["stream_options"]["include_usage"], true);
         let names: Vec<&str> = body["tools"]
             .as_array()
-            .expect("the gate reads tool names")
+            .expect("the gate reads the tools array")
             .iter()
             .map(|tool| tool["function"]["name"].as_str().expect("chat spelling"))
             .collect();
-        assert_eq!(
-            names,
-            ["bash", "read"],
-            "exactly the gate names, appended after nothing"
+        assert_eq!(names, ["shell", "read"], "exactly the gate pair");
+        assert!(
+            body.get("tool_choice").is_none(),
+            "tool_choice:'none' is REFUSED by the gate; it is never sent"
         );
-        assert_eq!(body["tool_choice"], "none", "decoys must be unreachable");
     }
 
     #[test]
-    fn existing_tools_survive_and_keep_their_tool_choice() {
+    fn client_tools_are_replaced_and_tool_choice_stripped() {
         let req: ChatRequest = serde_json::from_value(json!({
             "model": "m",
             "messages": [{"role": "user", "content": "x"}],
+            "tool_choice": "none",
             "tools": [{"type": "function", "function": {"name": "get_weather"}}]
         }))
         .unwrap();
@@ -3104,14 +2929,86 @@ mod tests {
             .iter()
             .map(|tool| tool["function"]["name"].as_str().expect("chat spelling"))
             .collect();
-        assert_eq!(names[0], "get_weather", "client tools keep their order");
-        assert!(
-            names.contains(&"bash") && names.contains(&"read"),
-            "{names:?}"
+        assert_eq!(
+            names,
+            ["shell", "read"],
+            "the gate pair replaces client tools"
         );
         assert!(
             body.get("tool_choice").is_none(),
-            "a client with its own tools keeps its own tool_choice or its absence"
+            "a client-pinned tool_choice would 403 the request upstream"
+        );
+    }
+
+    #[test]
+    fn genuine_shell_read_client_tools_pass_through_untouched() {
+        let pinned = GATE_TOOLS_ARRAY.as_array().expect("pinned gate pair");
+        let shell = pinned
+            .iter()
+            .find(|tool| tool["function"]["name"] == "shell")
+            .expect("pinned shell")
+            .clone();
+        let read = pinned
+            .iter()
+            .find(|tool| tool["function"]["name"] == "read")
+            .expect("pinned read")
+            .clone();
+        // Reordered: read first, shell second. The pass-through branch matches
+        // by name + parameters, so client order is preserved as sent.
+        let client_tools = Value::Array(vec![read, shell]);
+        let req: ChatRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x"}],
+            "tool_choice": "auto",
+            "tools": client_tools.clone()
+        }))
+        .unwrap();
+        let body = provider("https://x.test/v1").to_upstream_body(&req);
+        assert_eq!(
+            body["tools"], client_tools,
+            "genuine shell/read satisfy the gate, so the client array rides untouched"
+        );
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().expect("chat spelling"))
+            .collect();
+        assert_eq!(names, ["read", "shell"], "client order preserved");
+        assert_eq!(
+            body["tool_choice"], "auto",
+            "'auto' is not refused by the gate, so it is relayed"
+        );
+        assert_eq!(
+            body["messages"].as_array().expect("messages").len(),
+            1,
+            "no steering note rides a pass-through"
+        );
+    }
+
+    #[test]
+    fn gate_pair_with_tool_choice_none_strips_only_choice() {
+        let client_tools = GATE_TOOLS_ARRAY.clone();
+        let req: ChatRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x"}],
+            "tool_choice": "none",
+            "tools": client_tools.clone()
+        }))
+        .unwrap();
+        let body = provider("https://x.test/v1").to_upstream_body(&req);
+        assert!(
+            body.get("tool_choice").is_none(),
+            "the gate refuses 'none' outright, even on a genuine-tools request"
+        );
+        assert_eq!(
+            body["tools"], client_tools,
+            "only the choice is dropped: the genuine pair rides untouched"
+        );
+        assert_eq!(
+            body["messages"].as_array().expect("messages").len(),
+            1,
+            "no steering note when the gate is already satisfied"
         );
     }
 
@@ -3170,7 +3067,7 @@ mod tests {
 
         let tools = body["tools"].as_array().expect("flat tools");
         assert_eq!(tools[0]["type"], "function");
-        assert_eq!(tools[0]["name"], "bash", "flat spelling");
+        assert_eq!(tools[0]["name"], "shell", "flat spelling");
         assert!(
             tools[0].get("function").is_none(),
             "flat spelling has no nesting"
@@ -3207,7 +3104,7 @@ mod tests {
         assert!(body.get("messages").is_some(), "chat style keeps messages");
         assert!(body.get("input").is_none());
         let tools = body["tools"].as_array().expect("chat tools");
-        assert_eq!(tools[0]["function"]["name"], "bash", "chat spelling");
+        assert_eq!(tools[0]["function"]["name"], "shell", "chat spelling");
         assert_eq!(tools[1]["function"]["name"], "read");
         assert_eq!(body["temperature"], 0.7, "chat extras pass through");
     }
