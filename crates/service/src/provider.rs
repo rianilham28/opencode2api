@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 
 use opencode2api_kit::{
     CallContext, ChatChunk, ChatRequest, ChatStream, ChunkStream, Completion, Provider,
-    ProviderError, ToolCall, ToolCallDelta, UpstreamResponse, Usage, pool::CooldownReason,
+    ProviderError, RawReply, ToolCall, ToolCallDelta, UpstreamResponse, Usage,
+    pool::CooldownReason,
 };
 use opencode2api_transport::{Lane, Transport};
 
@@ -450,6 +451,11 @@ pub struct OpenAiProvider {
     /// the same normalized base as `chat_url` at boot.
     responses_url: reqwest::Url,
     models_url: reqwest::Url,
+    /// TypeSafe's System One endpoint, resolved from the same base at boot.
+    /// The vendor gates it by PROTOCOL, not by model: a chat-shaped request
+    /// for a `jev-*` model answers `ModelProtocolUnsupported`, so the decision
+    /// body has to reach this URL untouched.
+    systemone_url: reqwest::Url,
     /// The client identity every request presents, minted once here rather
     /// than per call — see `OpenCodeProfile`.
     opencode: OpenCodeProfile,
@@ -607,6 +613,7 @@ impl OpenAiProvider {
         let chat_url = parse_endpoint(&base, "chat/completions")?;
         let responses_url = parse_endpoint(&base, "responses")?;
         let models_url = parse_endpoint(&base, "models")?;
+        let systemone_url = parse_endpoint(&base, "systemone")?;
         let session = mint_opencode_session();
         let opencode = OpenCodeProfile {
             client: http::HeaderValue::from_static("cli"),
@@ -632,6 +639,7 @@ impl OpenAiProvider {
             chat_url,
             responses_url,
             models_url,
+            systemone_url,
             opencode,
             // A pool of one is still a pool: the rotation code then has ONE
             // path instead of a special case that only the second key ever
@@ -1596,6 +1604,47 @@ impl Provider for OpenAiProvider {
                 }
             }
         }
+    }
+
+    /// The protocol relay: TypeSafe System One decisions, verbatim in and out.
+    ///
+    /// The whole OpenCode identity rides through `decorate` (this is the smoke
+    /// the free-tier gate reads), but the BODY is the client's: `state` and
+    /// typed `questions` are not IR, so nothing here rewrites, tools-pins, or
+    /// forces a stream flag. Non-2xx passes through as received — a schema 422
+    /// and the vendor's `ModelProtocolUnsupported` are the client's answers.
+    ///
+    /// No credential cooldown: the free tier gates this surface by protocol and
+    /// identity, not by a metered key (a request with no `Authorization` at all
+    /// is answered), so a 401/429 here is not evidence about the pooled key.
+    async fn relay_protocol(
+        &self,
+        body: bytes::Bytes,
+        ctx: &CallContext<'_>,
+    ) -> Result<RawReply, ProviderError> {
+        let (client, lane) = self.transport.lane_client()?;
+        let req = client
+            .post(self.systemone_url.clone())
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json")
+            .body(body);
+        let (req, _slot) = self.decorate(req, None, ctx)?;
+        let resp = req.send().await.map_err(|e| {
+            match opencode2api_transport::classify_send(&e) {
+                opencode2api_transport::SendFault::Lane => lane.note_failure(),
+                opencode2api_transport::SendFault::Slow => {
+                    lane.note_slow();
+                    lane.note_used();
+                }
+                opencode2api_transport::SendFault::Other => {}
+            }
+            ProviderError::from(e)
+        })?;
+        // Headers arrived: the tunnel is proven whatever the vendor decided
+        // about the body.
+        lane.note_healthy();
+        lane.note_used();
+        RawReply::from_upstream(UpstreamResponse(resp), self.cfg.response_ceiling()).await
     }
 }
 

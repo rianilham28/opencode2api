@@ -28,6 +28,10 @@ use crate::{InboundFormat, Pipeline};
 pub(crate) const CHAT_PATH: &str = "/v1/chat/completions";
 pub(crate) const MESSAGES_PATH: &str = "/v1/messages";
 pub(crate) const RESPONSES_PATH: &str = "/v1/responses";
+/// TypeSafe's System One surface. Not a client dialect: the body is a decision
+/// request (`state` + typed `questions`), which no `ChatRequest` can carry, so
+/// it rides the provider's raw protocol seam instead of the IR.
+pub(crate) const SYSTEMONE_PATH: &str = "/v1/systemone";
 
 /// The ONE funnel for client-visible refusals before admission. It writes the
 /// terminal record with `result="rejected"`; the 404 fallback instead infers
@@ -672,11 +676,59 @@ async fn fidelity_relay(lane: Lane<'_>, d: Dialect) -> Response {
         path,
         query_key,
     } = lane;
-    let (permit, rid, started, queued_ms) = match admit(p, headers, fmt, endpoint, query_key).await
-    {
+    let admitted = match admit(p, headers, fmt, endpoint, query_key).await {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
+    let ctx = opencode2api_kit::CallContext::for_lane(admitted.1, Some(headers), path);
+    relay_once(
+        p,
+        fmt,
+        endpoint,
+        admitted,
+        p.provider.relay_raw(d, body.clone(), &ctx),
+    )
+    .await
+}
+
+/// `POST /v1/systemone` — TypeSafe System One decisions, relayed verbatim.
+///
+/// The route always exists; a provider with no such upstream surface answers
+/// its typed 501, which is clearer than a 404 that reads like a typo. Client
+/// auth and admission are the SAME gate every other client-visible path
+/// passes, so this cannot become a bypass.
+pub(crate) async fn systemone(
+    State(p): State<Pipeline>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let admitted = match admit(&p, &headers, InboundFormat::OpenAi, "systemone", None).await {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let ctx = opencode2api_kit::CallContext::new(admitted.1, Some(&headers));
+    relay_once(
+        &p,
+        InboundFormat::OpenAi,
+        "systemone",
+        admitted,
+        p.provider.relay_protocol(body, &ctx),
+    )
+    .await
+}
+
+/// One single-attempt reply: the fidelity lane and the protocol relay share the
+/// wall clock, the terminal `Done`, and byte-verbatim rendering. Extracted
+/// rather than copied because the ACCOUNTING is the part that must not drift
+/// between two lanes that both promise "the vendor's answer is the client's".
+async fn relay_once(
+    p: &Pipeline,
+    fmt: InboundFormat,
+    endpoint: &'static str,
+    admitted: (tokio::sync::OwnedSemaphorePermit, u64, Instant, u64),
+    reply: impl std::future::Future<Output = Result<RawReply, ProviderError>>,
+) -> Response {
+    let (permit, rid, started, queued_ms) = admitted;
     // The lane's Origin carries NO model: reading one would mean parsing the
     // body (or, for Gemini, the path) — the vendor knowledge this lane exists to
     // avoid. The record therefore omits the key, exactly as it omits the tokens
@@ -692,16 +744,11 @@ async fn fidelity_relay(lane: Lane<'_>, d: Dialect) -> Response {
         retries: 0,
         started,
     };
-    // The same server-side wall clock the fold's branches use: `relay_raw`
-    // is the lane's PRE-HANDOFF seam, so a breach is pre-handoff BY
-    // DEFINITION — the vendor committed no bytes through it, no byte already
-    // sent to a client is cut, and only a pinned admission permit is freed.
-    let ctx = opencode2api_kit::CallContext::for_lane(rid, Some(headers), path);
-    let handed = tokio::time::timeout(
-        Duration::from_secs(p.cfg.request_timeout_secs),
-        p.provider.relay_raw(d, body.clone(), &ctx),
-    )
-    .await;
+    // The same server-side wall clock the fold's branches use: the provider call
+    // is the lane's PRE-HANDOFF seam, so a breach is pre-handoff BY DEFINITION —
+    // the vendor committed no bytes through it, no byte already sent to a client
+    // is cut, and only a pinned admission permit is freed.
+    let handed = tokio::time::timeout(Duration::from_secs(p.cfg.request_timeout_secs), reply).await;
     match handed {
         Err(_) => {
             drop(permit); // pre-handoff: the slot is ours again

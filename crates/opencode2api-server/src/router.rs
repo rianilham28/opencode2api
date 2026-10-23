@@ -82,6 +82,10 @@ pub fn build_router(pipeline: Pipeline) -> Router {
     }
 
     router
+        // Not a client dialect, so no `server.dialects` gate: the surface is
+        // decided by the provider's `relay_protocol` (typed 501 when its
+        // upstream has no System One endpoint). Its body never enters the IR.
+        .route(routes::SYSTEMONE_PATH, post(routes::systemone))
         .route("/v1/models", get(routes::models))
         .route("/health", get(routes::health))
         .route("/ready", get(routes::ready))
@@ -260,6 +264,8 @@ pub(crate) fn endpoint_of_path(path: &str) -> &'static str {
         "messages"
     } else if path == routes::RESPONSES_PATH {
         "responses"
+    } else if path == routes::SYSTEMONE_PATH {
+        "systemone"
     } else if path == "/v1/models" || path == "/v1beta/models" {
         "models"
     } else if path.starts_with("/v1beta/models/") {

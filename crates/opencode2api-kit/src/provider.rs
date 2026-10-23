@@ -247,6 +247,29 @@ pub trait Provider: Send + Sync + 'static {
         Err(ProviderError::unsupported("models"))
     }
 
+    /// `/v1/systemone` — an upstream surface whose body the IR cannot carry.
+    ///
+    /// TypeSafe's System One models answer typed decisions (`state` plus
+    /// `questions`), not messages, so folding them through `ChatRequest` is
+    /// impossible by construction: the vendor refuses the chat protocol with
+    /// `ModelProtocolUnsupported`. The body is relayed verbatim and the reply
+    /// handed back as received:
+    /// - non-2xx replies come back as `Ok(RawReply)` — the vendor's own error
+    ///   envelope is the client's answer, and a TypeSafe SDK parses it;
+    /// - single attempt (no retry wrapper): the caller renders what the vendor
+    ///   said, including a schema 422;
+    /// - `Err` is reserved for proxy-side failures before send (auth, connect),
+    ///   where nothing was committed upstream.
+    ///
+    /// Default reports unsupported (501).
+    async fn relay_protocol(
+        &self,
+        _body: Bytes,
+        _ctx: &CallContext<'_>,
+    ) -> Result<RawReply, ProviderError> {
+        Err(ProviderError::unsupported("protocol relay"))
+    }
+
     /// Can this provider serve right now? A load balancer asks `/ready`, and
     /// the honest answer depends on egress: a proxy whose every lane is dead
     /// answers 503 to real traffic, so it must not answer 200 here.

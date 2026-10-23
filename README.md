@@ -18,6 +18,7 @@ dialects. All vendor behavior lives, as code, in exactly one file:
 | Free-tier gate | every upstream request forces `stream: true` (buffered → folded back; the post-`[DONE]` `cost` frame never reaches clients) and a `tools` array containing the genuine **`shell` and `read`** definitions — missing, gutted, or `tool_choice: "none"` is 403 `FreeTierError` (verified grid 2026-10-14: `tool_choice` is never sent; descriptions and `strict` are free; `parameters` shapes are hashed) |
 | Tool handling | **adaptive**: a client whose own tools already contain the genuine `shell`/`read` shapes (a real opencode client) gets them relayed untouched — it receives callable tool_calls for them and executes them itself; any other client gets its tools replaced by the pinned pair plus a one-line steering system message so the model answers in text instead of calling the placeholders. Foreign harness tools cannot relay at all — alone they 403 |
 | Client dialects | `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1beta/models/…` — all fold through the IR |
+| Protocol lane | `POST /v1/systemone` — TypeSafe System One decisions, relayed verbatim by `Provider::relay_protocol` (no IR, single attempt, vendor envelope passed through) |
 | Debugging | a Proxyman **reverse proxy** entry `opencode2api` (`127.0.0.1:10099 → 127.0.0.1:10081`) captures every client request; recording on, `opencode.ai` in the SSL-proxying list |
 | Config | `config.json` only — no `.env` needed for the quick start |
 
@@ -39,6 +40,13 @@ flow, workspace layout, contracts, and runbooks (in `AGENTS.md`).
 └──────────────────────────────────────────────────┘     └────────────────────────┘
                   opencode2api-server: pipeline, SSE relay, retry, envelopes
 ```
+
+One route is deliberately NOT a dialect: `POST /v1/systemone` (TypeSafe System
+One decisions — `state` plus typed `questions`) carries a body the IR cannot
+represent. It rides `Provider::relay_protocol`: the client's JSON goes to
+`{base}/systemone` untouched, the OpenCode identity headers ride along through
+`decorate`, and the vendor's envelope — answer or error — comes back untouched.
+A provider with no such surface answers a typed 501.
 
 1. **① inbound fold (`opencode2api-dialects`, vendor-blind).** Each client dialect
    has a module: request → IR (`ChatRequest`), and IR → that dialect's wire for
@@ -199,6 +207,7 @@ never had, typed 429/400/5xx envelopes, full-jitter retry, admission shed,
 | `/health` | 200 while the process lives, and **nothing more**. A live proxy whose upstream is gone should be pulled from rotation, not restarted into an outage nobody can diagnose. |
 | `/ready` | 200 when this proxy can actually serve; **503 + `Retry-After`** when it cannot — with a proxy pool configured, that means no healthy egress lane and no room to mint one. This is the route a load balancer should poll. It never mints a lane or sends anything upstream, so probing it every second costs nothing and cannot keep an idle pool alive at your vendor's expense. |
 | `/metrics` | Prometheus text, when the bin installed a recorder. |
+| `/v1/systemone` | TypeSafe System One decisions, relayed verbatim by `Provider::relay_protocol`: body in, vendor envelope out, **single attempt**, no IR. Not gated by `server.dialects` (it is not a client dialect); an upstream without the surface answers 501. |
 | `/v1/models` | The upstream's list, if the provider implements `models()`. |
 | `/v1beta/models` | The same list in Gemini's grammar — `models/<id>` resources carrying this surface's verbs — for a client whose SDK discovers with `listModels`. Rendered by `gemini::models_page` from the SAME `Provider::models()` the row above answers from. |
 | `/v1beta/models/{model}` | One model resource (`getModel`): `models/{id}` and the bare id name the same model, and a miss is a 404 rather than an empty answer. |

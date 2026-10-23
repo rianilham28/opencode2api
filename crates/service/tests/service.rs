@@ -2672,3 +2672,126 @@ async fn the_egress_metric_family_is_exposed_with_help() {
         egress.join("\n")
     );
 }
+
+const DECISION: &str = r#"{"model":"jev-1","state":{"turn":3,"notes":["a","b"],"scratch":{"z":1,"a":2}},"questions":{"q1":{"type":"noul","instructions":"pick one","criteria":[]},"q2":{"type":"score","instructions":"rate","criteria":["clarity"]}}}"#;
+
+/// The free-tier gate refuses System One traffic without the whole OpenCode
+/// identity, and the vendor refuses the body if the proxy touches it. Both
+/// halves are only observable on the wire, so this pins the request line,
+/// every identity header (including the 2.x session copies the gate pairs),
+/// and byte equality of the client's decision JSON.
+#[tokio::test]
+async fn systemone_relays_the_decision_body_with_the_opencode_identity() {
+    const ANSWER: &str =
+        r#"{"answers":{"q1":{"type":"noul","value":"ok"}},"vendor_marker":"relay-canary-200"}"#;
+    let (mock, state) = mock_upstream(vec![Reply::Buffered(ANSWER)]).await;
+    let (server, provider) = cfg_for(&format!("http://{}", mock.0));
+    let proxy = serve(Pipeline::new(
+        Arc::new(OpenAiProvider::new(client_for(&server), provider).unwrap()),
+        Arc::new(server),
+        None,
+    ))
+    .await;
+
+    let resp = client()
+        .post(format!("http://{proxy}/v1/systemone"))
+        .header("content-type", "application/json")
+        .body(DECISION)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.bytes().await.unwrap().as_ref(),
+        ANSWER.as_bytes(),
+        "the backend's answer must reach the client byte-for-byte"
+    );
+
+    let heads = state.heads.lock();
+    let bodies = state.bodies.lock();
+    assert_eq!(heads.len(), 1, "the relay is single-attempt by contract");
+    let head = &heads[0];
+    assert_eq!(request_method(head), "POST");
+    assert_eq!(request_target(head), "/v1/systemone");
+    assert_eq!(
+        header_value(head, "user-agent"),
+        Some("opencode/latest/2.0.27/cli"),
+        "the gate pairs this agent string with the tools fingerprint"
+    );
+    assert_eq!(header_value(head, "x-opencode-client"), Some("cli"));
+    let project = header_value(head, "x-opencode-project").expect("project header");
+    assert_eq!(project.len(), 40, "{project}");
+    assert!(project.bytes().all(|b| b.is_ascii_hexdigit()), "{project}");
+    let session = header_value(head, "x-opencode-session").expect("session header");
+    let tail = session.strip_prefix("ses_").expect("ses_ prefix");
+    assert_eq!(tail.len(), 26, "{session}");
+    assert!(
+        tail[..12]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "{session}: the ordered half is lowercase hex"
+    );
+    assert!(
+        tail[12..].bytes().all(|b| b.is_ascii_alphanumeric()),
+        "{session}: the tail is base62"
+    );
+    for name in [
+        "x-opencode-session-id",
+        "x-session-affinity",
+        "x-session-id",
+    ] {
+        assert_eq!(
+            header_value(head, name),
+            Some(session),
+            "{name} must repeat the minted session"
+        );
+    }
+    assert_eq!(
+        bodies[0],
+        DECISION.as_bytes(),
+        "the client's decision JSON must reach the backend byte-for-byte"
+    );
+}
+
+/// A vendor 422 (a TypeSafe schema/`ModelProtocolUnsupported` refusal) is the
+/// CLIENT's answer: the status and envelope pass through as received, with no
+/// status gate, no retry, and no error-envelope rewrite.
+#[tokio::test]
+async fn systemone_passes_a_vendor_422_envelope_through() {
+    const ENVELOPE: &str = r#"{"error":{"type":"ModelProtocolUnsupported","message":"Model does not support this protocol."},"vendor_marker":{"echo":{"model":"jev-1","state":{"turn":3}}}}"#;
+    let (mock, state) = mock_upstream(vec![Reply::Status(422, ENVELOPE)]).await;
+    let (server, provider) = cfg_for(&format!("http://{}", mock.0));
+    let proxy = serve(Pipeline::new(
+        Arc::new(OpenAiProvider::new(client_for(&server), provider).unwrap()),
+        Arc::new(server),
+        None,
+    ))
+    .await;
+
+    let resp = client()
+        .post(format!("http://{proxy}/v1/systemone"))
+        .body(DECISION)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        422,
+        "a vendor refusal is not rewritten into a proxy error"
+    );
+    assert_eq!(
+        resp.bytes().await.unwrap().as_ref(),
+        ENVELOPE.as_bytes(),
+        "the vendor envelope must reach the client byte-for-byte"
+    );
+    assert_eq!(
+        state.requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a committed decision is never re-sent"
+    );
+    assert_eq!(
+        state.bodies.lock()[0],
+        DECISION.as_bytes(),
+        "the body is still the client's on the error path"
+    );
+}

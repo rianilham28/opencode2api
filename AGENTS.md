@@ -365,6 +365,13 @@ truth for which; README "Quick start" lists the common ones.
   native (pinned by
   `fidelity_lane_keeps_tool_bodies_the_fold_must_reject`).
 
+- **`/v1/systemone` is a protocol lane, not a dialect.** A TypeSafe decision
+  body (`state` + typed `questions`) cannot enter the IR, so it rides
+  `Provider::relay_protocol` byte-for-byte: the vendor's envelope comes back
+  with its own status (a schema 422 included), it is single-attempt, it is
+  ungated by `server.dialects`, and a provider without the surface answers a
+  typed 501. The route still passes `admit()` and emits exactly one terminal
+  `Done` under `endpoint="systemone"`.
 - **A dialect you do not serve is ABSENT, not refusing.** `server.dialects`
   filters route registration in `build_router`, so an unserved surface 404s
   through the normal envelope. Do NOT reach for Cargo features here: gating
