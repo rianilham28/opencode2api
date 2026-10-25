@@ -818,8 +818,22 @@ struct WireDelta<'a> {
     reasoning_content: Option<Cow<'a, str>>,
     #[serde(borrow, default)]
     refusal: Option<Cow<'a, str>>,
-    #[serde(default)]
+    // `#[serde(default)]` covers an ABSENT field only; the vendor also emits an
+    // explicit `null` (`"tool_calls": null`), which failed as
+    // `invalid type: null, expected a sequence` and turned every buffered
+    // client request into a 502. Measured 2026-10-25 on deepseek-v4.1-flash-free.
+    #[serde(default, deserialize_with = "null_as_empty")]
     tool_calls: Vec<WireToolCall<'a>>,
+}
+
+/// Treat `null` like an absent sequence, for vendor frames that spell an empty
+/// array as `null`.
+fn null_as_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
@@ -1162,6 +1176,20 @@ fn serialized(value: Value) -> Option<Bytes> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The vendor spells an empty tool-call list as an explicit `null`
+    /// (`"delta":{"tool_calls":null}`). `#[serde(default)]` alone rejects that
+    /// as `invalid type: null, expected a sequence`, which 502'd every buffered
+    /// client request until the decode tolerated it.
+    #[test]
+    fn a_null_tool_calls_field_decodes_as_no_calls() {
+        let chunk = ChatChunk::from_wire(bytes::Bytes::from_static(
+            br#"{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":null,"content":"hi"},"finish_reason":null}]}"#,
+        ))
+        .expect("null tool_calls is an empty list, not a malformed frame");
+        assert_eq!(chunk.text, "hi");
+        assert!(chunk.tool_calls.is_empty());
+    }
 
     #[test]
     fn usage_decodes_openai_nested_and_anthropic_flat_accounting() {
