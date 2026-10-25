@@ -484,7 +484,13 @@ about any vendor's payload laws, which stay in the provider. The JA3 test
 (`client_hello_is_the_genuine_clients_ja3`) captures the hello on loopback and
 fails on drift, so a BoringSSL or configuration change is a red test rather
 than an outage. Encoded response bodies are decoded but never pooled (a codec
-stops at its own footer, before the HTTP framing terminal); identity bodies are.
+stops at its own footer, before the HTTP framing terminal), so the leg ASKS for
+`identity`: measured on the JSON endpoints (2026-10-25), the client's four
+codings cost ~760 ms per `/inference/v1/models` request (no reuse — every call
+pays TCP+TLS) while `identity` costs ~325 ms (pooled from the second request),
+both 200. SSE chat was never compressed, so it already pooled. The header is
+gate-neutral by A/B on a fresh sandbox IP (identity 200 twice, four codings 200
+once, same minute); the decoders stay for a server that ignores the request.
 
 Two diagnostics worth knowing before blaming the handshake. First, the BODY is
 a credential too: `429 FreeUsageLimitError` (with a `Retry-After`) is also the

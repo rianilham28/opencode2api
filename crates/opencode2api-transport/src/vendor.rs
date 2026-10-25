@@ -22,9 +22,11 @@
 //!   headers, not gate inputs, so they are not minted.
 //!
 //! What is NOT copied: TLS session resumption (the genuine client sends a PSK
-//! after its first verified handshake; this leg opens fresh connections), and
-//! the in-flight concurrency ceiling the vendor applies per sandbox, which is
-//! unmeasured — see `ServiceConfig::max_inflight`.
+//! after its first verified handshake; this leg reuses keep-alive connections
+//! per lane but never resumes a session, so a NEW connection pays the full
+//! handshake), and the in-flight concurrency ceiling the vendor applies per
+//! sandbox, which is unmeasured — `provider.max_inflight` is the operator's
+//! ceiling, not a measurement of the vendor's.
 //!
 //! The JA3 test at the bottom is the gate: it captures the ClientHello this
 //! module emits and fails on any drift from the measured fingerprint.
@@ -125,11 +127,24 @@ fn base64(input: &[u8]) -> String {
     out
 }
 
-/// The client's own default block, byte for byte. `Accept-Encoding` names four
-/// codings, so the response decoder must handle all four — advertising a
-/// coding the decoder cannot read would be the same lie in the other
-/// direction.
-const ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
+/// What the leg asks the origin to send.
+///
+/// The genuine client sends `gzip, deflate, br, zstd`, and the edge honours it
+/// (measured: every JSON reply arrives `content-encoding: br`). That costs
+/// CONNECTION REUSE: a codec stops at its own footer, the HTTP framing
+/// terminal is left unread, and the socket cannot be handed to the next
+/// request — so the leg paid a fresh TCP+TLS handshake per request. Measured
+/// on `/inference/v1/models` (2026-10-25): ~760 ms per request with the four
+/// codings (no pooling) vs ~325 ms with `identity` (pooled from request two),
+/// both 200/200. Identity also removes the 0.4 s TLS + 0.2 s TCP per call.
+///
+/// Gate-neutrality of this header is MEASURED, not assumed: the extreme matrix
+/// never varied `Accept-Encoding`, so an A/B was run on a fresh sandbox IP
+/// (Bun 1.4.3 TLS, identical minimal body, only this header differing,
+/// 2026-10-25): `identity` → 200 (01a171ac-ac0d…), the four codings → 200
+/// (01a171ac-b937…), `identity` again → 200 (01a171ac-c596…). The decoders
+/// stay: a server that ignores `identity` still gets handled.
+const ACCEPT_ENCODING: &str = "identity";
 
 /// A connection this module owns: a TCP socket, optionally inside a TLS
 /// stream, optionally behind a proxy tunnel.
@@ -1282,7 +1297,7 @@ mod tests {
                 "Connection: keep-alive\r\n",
                 "Accept: */*\r\n",
                 "Host: opencode.ai\r\n",
-                "Accept-Encoding: gzip, deflate, br, zstd\r\n",
+                "Accept-Encoding: identity\r\n",
                 "Content-Length: 2\r\n",
                 "\r\n",
             )
