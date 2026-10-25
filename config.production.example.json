@@ -36,6 +36,8 @@
     "model_map": {},
     "api_key": null,
     "api_keys": [],
-    "max_response_bytes": 67108864
+    "max_response_bytes": 67108864,
+    "max_inflight": null,
+    "models_url": null
   }
 }

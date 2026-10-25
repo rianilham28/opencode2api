@@ -1,6 +1,7 @@
 //! CUSTOMIZATION LAYER — everything vendor-shaped lives in this file, in
 //! code. Four seams, each a function you can edit without touching anything
-//! else: `decorate` (auth/headers), `to_upstream_body` (request translation),
+//! else: `identity_headers`/`authenticate` (the request's identity),
+//! `to_upstream_body` (request translation),
 //! `OpenAiProvider::complete` (buffered parse), `decode_upstream_sse`
 //! (stream translation).
 //!
@@ -16,11 +17,10 @@
 
 use async_stream::{stream, try_stream};
 use futures_util::{StreamExt, TryStreamExt};
-use http::header;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use opencode2api_kit::{
@@ -55,7 +55,7 @@ impl TouchOnDrop {
         // Gate read failures carry an explicit marker; other transport errors
         // retain reqwest's retryable 502 classification, unlike local verdicts.
         error.is_body_truncated()
-            || (error.is_retryable() && error.message.starts_with("upstream request failed:"))
+            || (error.is_retryable() && error.message.contains("upstream request failed:"))
     }
 }
 
@@ -332,34 +332,52 @@ struct OpenCodeProfile {
     session_id: http::HeaderValue,
 }
 
-/// The 2.x agent-string shape. NOT a free choice: upstream's free-tier gate
-/// pairs the agent version with an exact tools-body fingerprint (verified
-/// 2026-10-14: the 2.0.27 tool array is accepted only under UA 2.0.27, and
-/// 2.0.18/2.0.29 under the same array are 403'd with FreeTierError; on
-/// 2026-10-15 a direct call with UA 2.0.29 over the same array passed, so
-/// the pairing is not stable either way). The
-/// string therefore moves ONLY with a re-captured fingerprint in
-/// `fingerprint/opencode-*.json` — [GATE_TOOLS_JSON] carries the matching
-/// version. Chasing the published release here would silently break the
-/// pairing and 403 every request.
-const OPENCODE_UA: &str = "opencode/latest/2.0.27/cli";
+/// The agent string a genuine 2.1.4 client presents. Measured 2026-10-25:
+/// the vendored gate reads the SHAPE — three slash-separated segments starting
+/// `opencode/` (`opencode/9.9.9/cli` passes; `opencode`, `curl/8` and absent
+/// fail) — so this follows the captured client. The load-bearing parts of the
+/// body are a tool named exactly `read` ([`gate_read_tool`]), `stream: true`,
+/// and the `<env>` block in a system message ([`env_block`]).
+const OPENCODE_UA: &str = "opencode/latest/2.1.4/cli";
 
-/// The pinned tools-body fingerprint the gate expects BESIDE [`OPENCODE_UA`]:
-/// the genuinely-shaped `shell` and `read` tool definitions a real 2.0.27
-/// client sends (see `fingerprint/opencode-2.0.27.json`). Verified law
-/// (2026-10-14 grid): BOTH tools must be present — any order, other tools
-/// optional — with their `parameters` objects intact (emptied shapes 403);
-/// and `tool_choice:"none"` is REFUSED outright, so client `tool_choice` is
-/// stripped, never re-sent.
-const GATE_TOOLS_JSON: &str = include_str!("fingerprint/opencode-2.0.27.json");
+/// The working directory the synthesized `<env>` block names. The vendor does
+/// not read the VALUE (measured 2026-10-25: `/`, `/tmp`, `/root`, an empty
+/// value and a relative value all pass); it reads the literal `<env>` pair and
+/// the `Working directory:` line inside it. One constant, so every request
+/// presents the same environment.
+const SANDBOX_WORKDIR: &str = "/";
 
-static GATE_TOOLS_ARRAY: LazyLock<Value> = LazyLock::new(|| {
-    serde_json::from_str(GATE_TOOLS_JSON)
-        .ok()
-        .and_then(|v: Value| v.get("tools").cloned())
-        .filter(|v| v.is_array())
-        .expect("embedded gate tools fingerprint is a JSON object with a tools array")
-});
+/// The block the vendor's prompt check reads: ONE line, a literal `<env>` …
+/// `</env>` pair, and `Working directory:` inside it. Measured 2026-10-25:
+/// `<env x="1">`, `Working Directory:` (capital D), a pair that is empty
+/// before a later valid one, and an env block outside a system message all
+/// answer 429.
+fn env_block() -> String {
+    format!("<env>Working directory: {SANDBOX_WORKDIR}</env>")
+}
+
+/// The one tool the gate inspects: an array entry whose name is exactly
+/// `read`. Measured 2026-10-25: parameters, description and the wrapper are
+/// UNCONSTRAINED (a bare `{"name":"read"}` passes), while `READ` or a renamed
+/// `Read` fails — so this is the entire fingerprint, appended only when the
+/// caller did not send it.
+fn gate_read_tool() -> Value {
+    json!({ "name": "read" })
+}
+
+/// Whether `content` already carries the pair the vendor reads, so a caller's
+/// own environment block is never doubled. Only the FIRST pair counts: an
+/// empty `<env></env>` ahead of a valid one is what the vendor rejects.
+fn has_env_block(content: &str) -> bool {
+    let Some(start) = content.find("<env>") else {
+        return false;
+    };
+    let rest = &content[start + "<env>".len()..];
+    let Some(end) = rest.find("</env>") else {
+        return false;
+    };
+    rest[..end].contains("Working directory:")
+}
 
 /// Last `millis << 12 | counter` handed out, so values minted inside the
 /// same millisecond still differ — and still ascend — in their ordered half.
@@ -435,6 +453,11 @@ fn mint_opencode_project() -> http::HeaderValue {
 
 pub struct OpenAiProvider {
     transport: Arc<Transport>,
+    /// The vendor leg: BoringSSL at Bun's pin plus a hand-written HTTP/1.1
+    /// writer, because upstream's 429/200 split is a verdict on the TLS
+    /// stack and the request's header order. `reqwest` still owns the egress
+    /// pool (`transport`), and this dialer rides the same lanes.
+    vendor: opencode2api_transport::vendor::VendorClient,
     cfg: ServiceConfig,
     /// Client-facing alias lookup, prebuilt because responses and catalogue
     /// requests cross this seam in the hot path.
@@ -557,18 +580,21 @@ impl OpenAiProvider {
     /// discarded the `Arc`, so a catalogue fetch against a broken exit IP
     /// taught the pool nothing and chat kept receiving the same one.
     async fn fetch_catalogue(&self, ctx: &CallContext<'_>) -> Result<Value, ProviderError> {
-        let (client, lane) = self.transport.lane_client()?;
-        let req = client.get(self.models_url());
+        let lane = self.transport.lane()?;
         // The same pool as chat keeps a cooling key from being probed on every
         // catalogue refresh. The configured credential remains authoritative;
-        // caller credentials are not accepted on this proxy-owned catalogue.
-        let (req, slot) = if self.pool.is_empty() {
-            (self.with_request_id(req, ctx), None)
+        // caller credentials are not accepted on this proxy-owned catalogue,
+        // and a deployment with NO credential still fetches it unauthenticated
+        // (the free catalogue is public).
+        let mut headers = self.identity_headers();
+        let slot = if self.pool.is_empty() {
+            None
         } else {
-            self.decorate(req, None, ctx)?
+            self.authenticate(&mut headers, None)?
         };
-        let resp = req.send().await.map_err(|e| {
-            match opencode2api_transport::classify_send(&e) {
+        let req = opencode2api_transport::vendor::VendorRequest::get(self.models_url(), headers);
+        let resp = self.vendor.send(&lane, req).await.map_err(|e| {
+            match e.fault {
                 opencode2api_transport::SendFault::Lane => lane.note_failure(),
                 opencode2api_transport::SendFault::Slow => {
                     lane.note_slow();
@@ -576,11 +602,12 @@ impl OpenAiProvider {
                 }
                 opencode2api_transport::SendFault::Other => {}
             }
-            ProviderError::from(e)
+            e.into_provider_error()
         })?;
         // Headers arrived: the tunnel is proven, and only the completion below
         // is left to record.
         lane.note_healthy();
+        let resp = resp.into_response();
         let hint = Self::retry_hint(resp.headers());
         let resp =
             opencode2api_kit::errors::gate_response(&self.cfg.name, Some(ctx.request_id), resp)
@@ -601,6 +628,7 @@ impl OpenAiProvider {
     }
 
     pub fn new(transport: Arc<Transport>, cfg: ServiceConfig) -> anyhow::Result<Self> {
+        let vendor = transport.vendor_client(cfg.max_inflight)?;
         let mut reverse_model_map = HashMap::with_capacity(cfg.model_map.len());
         for (alias, vendor) in &cfg.model_map {
             if let Some(existing) = reverse_model_map.insert(vendor.clone(), alias.clone()) {
@@ -612,7 +640,12 @@ impl OpenAiProvider {
         let base = normalized_base(&cfg.base_url);
         let chat_url = parse_endpoint(&base, "chat/completions")?;
         let responses_url = parse_endpoint(&base, "responses")?;
-        let models_url = parse_endpoint(&base, "models")?;
+        let models_url = match cfg.models_url.as_deref() {
+            Some(url) => reqwest::Url::parse(url).map_err(|e| {
+                anyhow::anyhow!("provider.models_url does not form a usable URL ({e})")
+            })?,
+            None => parse_endpoint(&models_base(&base), "models")?,
+        };
         let systemone_url = parse_endpoint(&base, "systemone")?;
         let session = mint_opencode_session();
         let opencode = OpenCodeProfile {
@@ -635,6 +668,7 @@ impl OpenAiProvider {
         );
         Ok(Self {
             transport,
+            vendor,
             cfg,
             chat_url,
             responses_url,
@@ -824,51 +858,67 @@ impl OpenAiProvider {
     /// SEAM: auth, correlation, and required headers. A vendor needing
     /// `x-api-key`, JWT, or OAuth refresh grows its logic here.
     ///
-    /// Returns the SLOT it authenticated with, not just the builder, and that is
+    /// Returns the SLOT it authenticated with, not just the headers, and that is
     /// the point: the credential that carried a request is the credential a 429
-    /// against that request has to spend. A seam returning only the builder
+    /// against that request has to spend. A seam returning only the headers
     /// pushes every caller to pick again, and a second pick hands back a
     /// DIFFERENT key under concurrency — the rate limit would then cool a
     /// credential that never saw it.
-    fn decorate(
-        &self,
-        req: reqwest::RequestBuilder,
-        client_bearer: Option<&str>,
-        ctx: &CallContext<'_>,
-    ) -> Result<(reqwest::RequestBuilder, Option<usize>), ProviderError> {
-        let req = self.with_request_id(req, ctx);
+    ///
+    /// Names are spelled WITH their case and returned as an ordered list
+    /// because the vendor leg writes them itself: upstream's gate reads the
+    /// request's shape, and hyper's encoder lowercases and reorders. The leg
+    /// sorts this list byte-wise, which is where `Authorization` ends up ahead
+    /// of `b3` and `x-opencode-*` on the wire.
+    ///
+    /// There is deliberately NO `x-request-id`: the genuine client never sends
+    /// one, and a per-call UUID in a request whose shape is load-bearing is
+    /// noise the proxy does not need to add. The caller's request id survives
+    /// in this process's logs and terminal record instead.
+    fn identity_headers(&self) -> Vec<(String, String)> {
         // The whole identity rides every request: upstream's gate 403s unless
         // all of these are present, the minted pair is the SAME on every call
         // so this process reads as one long-lived opencode session.
         let profile = &self.opencode;
-        let req = req
-            .header(
-                header::USER_AGENT,
-                header::HeaderValue::from_static(OPENCODE_UA),
-            )
-            .header("x-opencode-client", profile.client.clone())
-            .header("x-opencode-project", profile.project.clone())
-            .header("x-opencode-session", profile.session.clone())
+        let header = |value: &http::HeaderValue| {
+            value
+                .to_str()
+                .expect("minted identity headers are ASCII")
+                .to_string()
+        };
+        vec![
+            ("User-Agent".to_string(), OPENCODE_UA.to_string()),
+            ("x-opencode-client".to_string(), header(&profile.client)),
+            ("x-opencode-project".to_string(), header(&profile.project)),
+            ("x-opencode-session".to_string(), header(&profile.session)),
             // The 2.x profile repeats the session in three more headers; the
             // gate 403s without the session-id copy (verified 2026-10-14:
             // affinity and session-id may drop, this one may not).
-            .header("x-opencode-session-id", profile.session_id.clone())
-            .header("x-session-affinity", profile.affinity.clone())
-            .header("x-session-id", profile.session_id.clone());
+            (
+                "x-opencode-session-id".to_string(),
+                header(&profile.session_id),
+            ),
+            ("x-session-affinity".to_string(), header(&profile.affinity)),
+            ("x-session-id".to_string(), header(&profile.session_id)),
+        ]
+    }
+
+    /// Add the credential to a set of identity headers, returning the pool
+    /// slot that carried it — the slot a 429 against this request must spend.
+    fn authenticate(
+        &self,
+        headers: &mut Vec<(String, String)>,
+        client_bearer: Option<&str>,
+    ) -> Result<Option<usize>, ProviderError> {
         match self.credential(client_bearer)? {
-            Some((token, slot)) => Ok((req.bearer_auth(token), slot)),
+            Some((token, slot)) => {
+                headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+                Ok(slot)
+            }
             None => Err(ProviderError::bad_request(
                 "no upstream credential available",
             )),
         }
-    }
-
-    fn with_request_id(
-        &self,
-        req: reqwest::RequestBuilder,
-        ctx: &CallContext<'_>,
-    ) -> reqwest::RequestBuilder {
-        req.header("x-request-id", ctx.request_id.to_string())
     }
 
     /// SEAM: IR -> vendor request body. Per-model field renames belong HERE
@@ -884,13 +934,23 @@ impl OpenAiProvider {
         }
     }
 
-    /// The chat-dialect body, with the free-tier gate satisfied: `stream` is
-    /// forced true (a buffered request 403s even when the tools are right),
-    /// the tools array must contain the genuine `shell`/`read` pair (see
-    /// [GATE_TOOLS_ARRAY]), and `tool_choice` must NOT be present — the gate
-    /// refuses `"none"` outright, and any client-pinned choice rides tools we
-    /// can never execute. A client's own tools cannot ride: the gate checks
-    /// this side's fingerprint, so they are replaced.
+    /// The chat-dialect body, with the free-tier gate satisfied:
+    /// - the leading system message carries a literal `<env>` … `</env>` pair
+    ///   with `Working directory:` (synthesized when the caller sent none, or
+    ///   appended to the caller's own system turn when it lacks one) — measured
+    ///   2026-10-25: without the pair the vendor answers 429;
+    /// - `stream: true` and `stream_options.include_usage` are forced (the
+    ///   genuine client sends both);
+    /// - `max_completion_tokens` is the output-cap spelling and is only sent
+    ///   when the caller asked for one (the gate ignores it otherwise);
+    /// - the caller's `tools` array is RELAYED verbatim, with a bare
+    ///   `{"name":"read"}` appended only when no tool named exactly `read` is
+    ///   present — the gate's one tool law (measured: foreign names and extra
+    ///   tools pass, a renamed `Read` or an empty array fails).
+    ///   `tool_choice:"none"` is never relayed.
+    ///
+    /// A caller with no translatable file-read tool gets the steering note:
+    /// the appended `read` is a placeholder it cannot execute.
     fn chat_body(&self, req: &ChatRequest, vendor: &str) -> Value {
         let mut body = req.to_value();
         let Some(map) = body.as_object_mut() else {
@@ -898,38 +958,51 @@ impl OpenAiProvider {
         };
         map.insert("model".into(), vendor.into());
         map.insert("stream".into(), true.into());
+        // The genuine client spells the output cap `max_completion_tokens`
+        // and never sends `max_tokens`; upstream reads the body's shape, so
+        // the client's spelling is translated rather than relayed.
+        if let Some(limit) = map.remove("max_tokens") {
+            map.entry("max_completion_tokens").or_insert(limit);
+        }
+        // No cap is INVENTED: the gate treats the field as optional and
+        // ignores a value it did not ask for (measured: absent → 200, 1 → 200,
+        // 0 → 400). A caller that asked for one gets its own number back.
         map.entry("stream_options")
             .or_insert_with(|| json!({ "include_usage": true }));
-        let client_sent_tools = map.contains_key("tools");
-        // Pass-through when the client's own tools ALREADY satisfy the gate —
-        // an opencode-native caller declaring genuine `shell` and `read` (its
-        // tool_calls for them are executable by the caller itself) gets its
-        // array relayed untouched, with no steering note. Only a refused
-        // `tool_choice:"none"` is dropped. Anything else is replaced by the
-        // pinned pair; a harness client then expects tool_calls it can never
-        // receive for its own tools, so the steering note keeps the model
-        // answering in text instead of calling the placeholders (observed
-        // 2026-10-14).
-        let client_has_gate_pair = client_sent_tools
-            && map["tools"].as_array().is_some_and(|tools| {
-                tools.iter().any(is_genuine_shell_tool) && tools.iter().any(is_genuine_read_tool)
-            });
+        // The caller's tools are RELAYED, never replaced: the gate only checks
+        // that a function named `read` exists with a genuine-shaped schema
+        // (measured 2026-10-25: foreign names and extra tools pass beside it;
+        // a renamed `Read` fails). So the gateway appends the genuine `read`
+        // when the caller did not declare one, and leaves everything else the
+        // caller declared callable.
+        let caller_tools = map
+            .get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut tools = caller_tools.clone();
+        let has_exact_read = caller_tools
+            .iter()
+            .any(|tool| tool_name(tool) == Some("read"));
+        if !has_exact_read {
+            tools.push(gate_read_tool());
+        }
+        map.insert("tools".into(), Value::Array(tools));
         if let Some("none") = map.get("tool_choice").and_then(Value::as_str) {
             map.remove("tool_choice");
         }
-        if !client_has_gate_pair {
-            map.remove("tool_choice");
-            map.insert("tools".into(), GATE_TOOLS_ARRAY.clone());
-            if client_sent_tools
-                && let Some(messages) = map.get_mut("messages").and_then(Value::as_array_mut)
-            {
+        let caller_declares_read =
+            has_exact_read || read_target_from_tools(&caller_tools).is_some();
+        if let Some(messages) = map.get_mut("messages").and_then(Value::as_array_mut) {
+            ensure_env_block(messages);
+            if !caller_declares_read {
                 messages.insert(
-                        0,
-                        json!({
-                            "role": "system",
-                            "content": "The tools in the caller's original request are not available through this gateway: the `shell` and `read` entries in `tools` are gateway placeholders that cannot be executed. Do not call any tool. Answer the user's request in plain text."
-                        }),
-                    );
+                    1,
+                    json!({
+                        "role": "system",
+                        "content": "The `read` entry in `tools` is a gateway placeholder the caller cannot execute: do not call it. Every other tool in `tools` was declared by the caller and may be called normally."
+                    }),
+                );
             }
         }
         body
@@ -953,13 +1026,26 @@ impl OpenAiProvider {
                 max_tokens.as_u64().unwrap_or(16).max(16).into(),
             );
         }
-        // Same fingerprint law as the chat body, in the Responses dialect's
-        // flat tool spelling. UNVERIFIED on the new gate: the 2.0.27 capture
-        // only shows the chat shape, so this path needs re-checking against a
+        // Same tool law as the chat body, in the Responses dialect's flat
+        // spelling: the caller's tools are relayed, with a bare `read`
+        // appended when absent. UNVERIFIED on the new gate — the matrix was
+        // measured on the chat surface — so this needs re-checking against a
         // muse-spark model before relying on it. `tool_choice` shares the
         // chat-side ban on "none", so it is stripped, never relayed.
         map.remove("tool_choice");
-        map.insert("tools".into(), flat_pinned_tools());
+        let caller = req.to_value();
+        let mut tools: Vec<Value> = caller
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(|tools| tools.iter().map(flat_tool).collect())
+            .unwrap_or_default();
+        if !tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("read"))
+        {
+            tools.push(gate_read_tool());
+        }
+        map.insert("tools".into(), Value::Array(tools));
         for key in ["temperature", "top_p", "stop", "parallel_tool_calls"] {
             if let Some(value) = req.extra.get(key) {
                 map.insert(key.into(), value.clone());
@@ -1017,30 +1103,37 @@ impl OpenAiProvider {
             completed: false,
             transport_error: false,
         };
-        let req = touch
-            .lane
-            .client()
-            .post(url)
-            .json(body)
-            // The gate does not read Accept (`*/*` and `application/json`
-            // both pass), so one value serves the buffered and streaming
-            // paths instead of a per-mode choice. `from_static` validates
-            // nothing at request time.
-            .header(header::ACCEPT, http::HeaderValue::from_static("*/*"));
-        let (req, slot) = self
-            .decorate(req, ctx.client_authorization(), ctx)
+        let mut headers = self.identity_headers();
+        headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        let slot = self
+            .authenticate(&mut headers, ctx.client_authorization())
             .map_err(|e| (e, false))?;
-        let resp = match req.send().await {
+        let encoded = serde_json::to_vec(body).map_err(|e| {
+            (
+                ProviderError::permanent_bad_gateway(format!("request body: {e}")),
+                false,
+            )
+        })?;
+        // The vendored leg writes this request itself — TLS identity, header
+        // order, and case are the credential upstream reads. `Accept: */*`
+        // is the client's own default, appended by the writer for every
+        // request rather than chosen per mode (the gate does not read it).
+        let req = opencode2api_transport::vendor::VendorRequest::post(
+            url,
+            headers,
+            bytes::Bytes::from(encoded),
+        );
+        let resp = match self.vendor.send(&touch.lane, req).await {
             Ok(resp) => resp,
             // Only transport-shaped failures are the lane's fault. An
             // upstream 429 or 500 arrived THROUGH a working tunnel and says
             // nothing about the exit IP — attributing those would retire
             // healthy lanes every time the vendor rate-limits us. A timeout
-            // gets its own label for the same reason: `is_timeout` cannot
-            // tell a dead tunnel from a slow generation, and three slow
-            // generations must not retire three healthy exit IPs.
+            // gets its own label for the same reason: a peer that accepted
+            // the connection and then went silent may just be slow, and three
+            // slow generations must not retire three healthy exit IPs.
             Err(e) => {
-                match opencode2api_transport::classify_send(&e) {
+                match e.fault {
                     opencode2api_transport::SendFault::Lane => touch.transport_error(),
                     // Counted and labelled, never charged: the guard drops
                     // into `note_used`, which touches the lane's clock without
@@ -1048,9 +1141,10 @@ impl OpenAiProvider {
                     opencode2api_transport::SendFault::Slow => touch.lane.note_slow(),
                     opencode2api_transport::SendFault::Other => {}
                 }
-                return Err((ProviderError::from(e), false));
+                return Err((e.into_provider_error(), false));
             }
         };
+        let resp = resp.into_response();
         // A working tunnel proves lane health at handoff; idle use remains
         // completion-bound and is recorded by the guard below.
         touch.lane.note_healthy();
@@ -1161,6 +1255,20 @@ fn parse_endpoint(base: &str, path: &str) -> anyhow::Result<reqwest::Url> {
         .map_err(|e| anyhow::anyhow!("provider.base_url does not form a usable URL ({e})"))
 }
 
+/// Where the catalogue lives, when `provider.models_url` is not set.
+///
+/// The vendor's own split, measured 2026-10-25: its new chat root
+/// (`/inference/openai/v1`) serves completions but NOT the model list, while
+/// the legacy root (`/inference/v1`) serves both. Everything under another
+/// vendor's base keeps the ordinary `{base}/models` shape, which is also what
+/// the local/mock bases in the test suite use.
+fn models_base(base: &str) -> String {
+    match base.split_once("/inference/openai/") {
+        Some((vendor_root, _)) => format!("{vendor_root}/inference/v1"),
+        None => base.to_string(),
+    }
+}
+
 /// The vendor ids answered ONLY by the Responses dialect — a chat call on
 /// them 500s upstream (live-probed), so this split is keyed on the id after
 /// `model_map`, never on the client's alias.
@@ -1171,66 +1279,287 @@ fn is_responses_style(vendor: &str) -> bool {
     )
 }
 
-/// A client tool matches a pinned gate tool when its NAME and `parameters`
-/// object are equivalent to the pinned definition. Description text and the
-/// `strict` flag were verified free (2026-10-14: a perturbed description and
-/// an added `strict` both passed beside genuine param shapes) — the param
-/// shapes are what the gate hashes.
-fn tool_matches_pinned(tool: &Value, pinned: &Value) -> bool {
-    let (tool_fn, pinned_fn) = match (tool.get("function"), pinned.get("function")) {
-        (Some(a), Some(b)) => (a, b),
-        _ => return false,
-    };
-    tool_fn.get("name") == pinned_fn.get("name")
-        && tool_fn.get("parameters") == pinned_fn.get("parameters")
+fn is_system_message(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("system")
 }
 
-fn is_genuine_shell_tool(tool: &Value) -> bool {
-    GATE_TOOLS_ARRAY
-        .as_array()
-        .and_then(|pair| pair.iter().find(|p| p["function"]["name"] == "shell"))
-        .is_some_and(|pinned| tool_matches_pinned(tool, pinned))
+fn system_text(message: &Value) -> Option<&str> {
+    message.get("content").and_then(Value::as_str)
 }
 
-fn is_genuine_read_tool(tool: &Value) -> bool {
-    GATE_TOOLS_ARRAY
-        .as_array()
-        .and_then(|pair| pair.iter().find(|p| p["function"]["name"] == "read"))
-        .is_some_and(|pinned| tool_matches_pinned(tool, pinned))
-}
-
-/// The pinned chat-shaped fingerprint, re-spelled into the flat Responses
-/// dialect: each `{type,function:{name,description,parameters,…}}` entry is
-/// unwrapped to `{type,name,description,parameters,…}`, key order preserved.
-fn flat_pinned_tools() -> Value {
-    let mut out = Vec::with_capacity(GATE_TOOLS_ARRAY.as_array().map_or(0, Vec::len));
-    for tool in GATE_TOOLS_ARRAY
-        .as_array()
-        .expect("checked at construction")
+/// Put the `<env>` block the vendor reads into a SYSTEM message, per the
+/// measured predicates:
+/// - any system message that already carries a valid pair (first pair inside
+///   that message) is left untouched;
+/// - otherwise the FIRST system message gets the block — appended after its
+///   text, or placed FIRST when it already holds a `<env>` token the vendor
+///   would reject (an empty pair ahead of ours would be the first match);
+/// - a caller with no system message gets one in front.
+fn ensure_env_block(messages: &mut Vec<Value>) {
+    let block = env_block();
+    if messages
+        .iter()
+        .filter(|message| is_system_message(message))
+        .any(|message| system_text(message).is_some_and(has_env_block))
     {
-        let Some(function) = tool.get("function") else {
-            out.push(tool.clone());
-            continue;
-        };
-        let mut flat = serde_json::Map::new();
-        if let Some(t) = tool.get("type") {
-            flat.insert("type".into(), t.clone());
-        }
-        if let Some(name) = function.get("name") {
-            flat.insert("name".into(), name.clone());
-        }
-        if let Some(description) = function.get("description") {
-            flat.insert("description".into(), description.clone());
-        }
-        if let Some(parameters) = function.get("parameters") {
-            flat.insert("parameters".into(), parameters.clone());
-        }
-        if let Some(strict) = function.get("strict") {
-            flat.insert("strict".into(), strict.clone());
-        }
-        out.push(Value::Object(flat));
+        return;
     }
-    Value::Array(out)
+    let Some(first) = messages
+        .iter_mut()
+        .find(|message| is_system_message(message))
+    else {
+        messages.insert(0, json!({ "role": "system", "content": block }));
+        return;
+    };
+    match first.get_mut("content") {
+        Some(Value::String(content)) => {
+            if content.contains("<env") {
+                *content = format!("{block}\n\n{content}");
+            } else if content.is_empty() {
+                *content = block;
+            } else {
+                content.push_str("\n\n");
+                content.push_str(&block);
+            }
+        }
+        // A system turn split into parts: the block is one more part, so
+        // nothing the caller sent is replaced.
+        Some(Value::Array(parts)) => {
+            let holds_tag = parts.iter().any(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("<env>"))
+            });
+            let part = json!({ "type": "text", "text": block });
+            if holds_tag {
+                parts.insert(0, part);
+            } else {
+                parts.push(part);
+            }
+        }
+        _ => {
+            first["content"] = Value::String(block);
+        }
+    }
+}
+
+/// The name of a tool entry: the chat-shaped nesting OR a flat/bare name
+/// (the matrix measured a bare `{"name":"read"}` as sufficient).
+fn tool_name(tool: &Value) -> Option<&str> {
+    tool.get("function")
+        .and_then(|function| function.get("name"))
+        .or_else(|| tool.get("name"))
+        .and_then(Value::as_str)
+}
+
+/// Where a vendor `read` call must land when the caller declared a file-read
+/// tool under another name: Claude Code says `Read` and takes `file_path`,
+/// Cline says `read_file` and takes `path`, and a client may or may not take
+/// `offset`/`limit`. Everything here is read off the CALLER's schema, so the
+/// translation only ever emits fields that tool declares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReadTarget {
+    name: String,
+    path_param: String,
+    keeps_offset: bool,
+    keeps_limit: bool,
+}
+
+/// Recognize a caller's file-read tool and the parameter names it uses.
+///
+/// The name set is deliberately small and documented: `read` (any case), the
+/// snake/camel `read_file` spellings Cline uses. A tool this does not
+/// recognize is left alone — renaming a `read` call into an arbitrary tool
+/// the model never saw would be worse than the client's own unknown-tool
+/// error.
+fn read_target(tool: &Value) -> Option<ReadTarget> {
+    // Enveloped (`{type,function:{…}}`) and bare/flat (`{name,parameters}`)
+    // entries are both legal wire input — the matrix measured a bare read as
+    // sufficient — so name and schema are read from either shape.
+    let (name, parameters) = match tool.get("function") {
+        Some(function) => (function.get("name")?.as_str()?, function.get("parameters")?),
+        None => (tool.get("name")?.as_str()?, tool.get("parameters")?),
+    };
+    let normalized = name.to_ascii_lowercase().replace(['-', '_'], "");
+    if normalized != "read" && normalized != "readfile" {
+        return None;
+    }
+    let properties = parameters.get("properties")?.as_object()?;
+    let path_param = ["file_path", "path", "filename", "file"]
+        .iter()
+        .find(|key| properties.contains_key(**key))?
+        .to_string();
+    Some(ReadTarget {
+        name: name.to_string(),
+        path_param,
+        keeps_offset: properties.contains_key("offset"),
+        keeps_limit: properties.contains_key("limit"),
+    })
+}
+
+/// The translation a request needs, if any: `Some` only when the caller
+/// declares a read-shaped tool under a name other than the gate's lowercase
+/// `read` (an exact `read` needs no translation; no read tool at all is the
+/// steering-note case).
+fn read_target_from_tools(tools: &[Value]) -> Option<ReadTarget> {
+    if tools.iter().any(|tool| tool_name(tool) == Some("read")) {
+        return None;
+    }
+    tools.iter().find_map(read_target)
+}
+
+/// Rewrite a `read` call's arguments into the caller's field names.
+fn translate_read_arguments(arguments: &str, target: &ReadTarget) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(arguments) else {
+        return arguments.to_string();
+    };
+    let Some(map) = value.as_object_mut() else {
+        return arguments.to_string();
+    };
+    if let Some(path) = map.remove("path") {
+        map.insert(target.path_param.clone(), path);
+    }
+    if !target.keeps_offset {
+        map.remove("offset");
+    }
+    if !target.keeps_limit {
+        map.remove("limit");
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| arguments.to_string())
+}
+
+/// Rename and re-shape any `read` tool calls in a folded completion, forcing
+/// the dialect to synthesize from fields when a call changed (the vendor's
+/// verbatim frame would otherwise re-emit the untranslated name).
+fn translate_completion_calls(completion: &mut Completion, target: Option<&ReadTarget>) {
+    let Some(target) = target else {
+        return;
+    };
+    let mut changed = false;
+    for call in &mut completion.tool_calls {
+        if call.name == "read" {
+            call.name.clone_from(&target.name);
+            call.arguments = translate_read_arguments(&call.arguments, target);
+            changed = true;
+        }
+    }
+    if changed {
+        completion.raw = None;
+    }
+}
+
+/// Translate streamed `read` tool calls into the caller's own read tool.
+///
+/// Arguments arrive as JSON fragments, so a translated call is BUFFERED until
+/// the stream finishes and emitted as one complete delta before the terminal
+/// chunk. Text, reasoning, usage and the caller's other tool calls pass
+/// through untouched; a chunk that only carried a buffered call is dropped.
+fn translate_read_calls(
+    stream: impl futures_util::Stream<Item = Result<ChatChunk, ProviderError>> + Send + 'static,
+    target: Option<ReadTarget>,
+) -> ChatStream {
+    let Some(target) = target else {
+        return stream.boxed();
+    };
+    async_stream::try_stream! {
+        let mut pending: BTreeMap<u32, (Option<String>, String)> = BTreeMap::new();
+        let mut id = String::new();
+        let mut model = String::new();
+        let mut stream = std::pin::pin!(stream);
+        while let Some(item) = stream.next().await {
+            let mut chunk = item?;
+            id.clone_from(&chunk.id);
+            model.clone_from(&chunk.model);
+            if !chunk.tool_calls.is_empty() {
+                let mut kept = Vec::with_capacity(chunk.tool_calls.len());
+                for delta in std::mem::take(&mut chunk.tool_calls) {
+                    let belongs =
+                        delta.name.as_deref() == Some("read") || pending.contains_key(&delta.index);
+                    if belongs {
+                        let entry = pending.entry(delta.index).or_insert((None, String::new()));
+                        if delta.name.is_some() {
+                            entry.0 = delta.name;
+                        }
+                        entry.1.push_str(&delta.arguments);
+                    } else {
+                        kept.push(delta);
+                    }
+                }
+                chunk.tool_calls = kept;
+                chunk.raw = None;
+            }
+            if chunk.finish_reason.is_some() {
+                for (index, (call_id, arguments)) in std::mem::take(&mut pending) {
+                    yield translated_call_chunk(&id, &model, index, call_id, &arguments, &target);
+                }
+            }
+            if chunk.text.is_empty()
+                && chunk.tool_calls.is_empty()
+                && chunk.usage.is_none()
+                && chunk.finish_reason.is_none()
+                && chunk.reasoning.is_empty()
+                && chunk.refusal.is_empty()
+            {
+                continue;
+            }
+            yield chunk;
+        }
+        for (index, (call_id, arguments)) in std::mem::take(&mut pending) {
+            yield translated_call_chunk(&id, &model, index, call_id, &arguments, &target);
+        }
+    }
+    .boxed()
+}
+
+/// One synthesized chunk carrying a completed, translated tool call.
+fn translated_call_chunk(
+    id: &str,
+    model: &str,
+    index: u32,
+    call_id: Option<String>,
+    arguments: &str,
+    target: &ReadTarget,
+) -> ChatChunk {
+    ChatChunk {
+        id: id.to_string(),
+        model: model.to_string(),
+        text: String::new(),
+        finish_reason: None,
+        usage: None,
+        tool_calls: vec![ToolCallDelta {
+            index,
+            id: call_id,
+            name: Some(target.name.clone()),
+            arguments: translate_read_arguments(arguments, target),
+        }],
+        raw: None,
+        reasoning: String::new(),
+        refusal: String::new(),
+    }
+}
+
+/// One chat-shaped tool re-spelled into the Responses dialect's flat form:
+/// `{type,function:{name,description,parameters,…}}` becomes
+/// `{type,name,description,parameters,…}`, key order preserved. An entry that
+/// is already flat is passed through.
+fn flat_tool(tool: &Value) -> Value {
+    let Some(function) = tool.get("function") else {
+        return tool.clone();
+    };
+    let mut flat = serde_json::Map::new();
+    if let Some(t) = tool.get("type") {
+        flat.insert("type".into(), t.clone());
+    }
+    if let Some(name) = function.get("name") {
+        flat.insert("name".into(), name.clone());
+    }
+    if let Some(description) = function.get("description") {
+        flat.insert("description".into(), description.clone());
+    }
+    if let Some(parameters) = function.get("parameters") {
+        flat.insert("parameters".into(), parameters.clone());
+    }
+    Value::Object(flat)
 }
 
 /// Chat messages -> the Responses `input` item array: text parts rename by
@@ -1448,22 +1777,25 @@ impl Provider for OpenAiProvider {
         let (resp, mut touch) = self.send(self.upstream_url(vendor), body, ctx).await?;
         let max = self.cfg.response_ceiling();
         let restore = model_restore(&req.model, &self.cfg.model_map);
+        let translation = request_read_translation(req);
         if resp.is_sse() {
             // The gate forces every request to stream, so a buffered client's
             // completion is a fold over the very SSE the stream path decodes.
-            return if is_responses_style(vendor) {
+            let mut completion = if is_responses_style(vendor) {
                 fold_completion(
                     decode_responses_sse(resp.into_chunks(), max, vendor, touch),
                     restore,
                 )
-                .await
+                .await?
             } else {
                 fold_completion(
                     decode_upstream_sse(resp.into_chunks(), max, restore.clone(), touch),
                     restore,
                 )
-                .await
+                .await?
             };
+            translate_completion_calls(&mut completion, translation.as_ref());
+            return Ok(completion);
         }
         let bytes = resp.body_bytes_capped(max).await.inspect_err(|error| {
             if touch.classify_body_error(error) {
@@ -1473,13 +1805,14 @@ impl Provider for OpenAiProvider {
         let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
             ProviderError::permanent_bad_gateway(format!("upstream body was not JSON: {e}"))
         })?;
-        let completion = if is_responses_style(vendor) {
+        let mut completion = if is_responses_style(vendor) {
             let mut completion = completion_from_responses(value, vendor)?;
             restore_requested_model(&mut completion.model, restore.as_ref());
             completion
         } else {
             self.completion_from_openai(&req.model, value)?
         };
+        translate_completion_calls(&mut completion, translation.as_ref());
         touch.complete();
         Ok(completion)
     }
@@ -1497,7 +1830,8 @@ impl Provider for OpenAiProvider {
         if is_responses_style(vendor) {
             to_ir_stream_responses(resp, max, vendor, restore, touch).await
         } else {
-            to_ir_stream(resp, max, restore, touch).await
+            let ir = to_ir_stream(resp, max, restore, touch).await?;
+            Ok(translate_read_calls(ir, request_read_translation(req)))
         }
     }
 
@@ -1526,12 +1860,29 @@ impl Provider for OpenAiProvider {
         }
         let body = self.to_upstream_body(req);
         let (resp, touch) = self.send(self.upstream_url(vendor), body, ctx).await?;
+        let translation = request_read_translation(req);
         if resp.is_sse() {
-            return Ok(touch_when_stream_ends(
-                resp,
-                self.cfg.response_ceiling(),
-                touch,
-            ));
+            // Byte fidelity is the lane's contract, and a `read` tool call the
+            // caller cannot execute is the one thing that overrides it: when
+            // the caller declared its file-read tool under another name, the
+            // stream rides the IR path so the call can be translated. Without
+            // a translation the bytes are relayed untouched.
+            return match translation {
+                None => Ok(touch_when_stream_ends(
+                    resp,
+                    self.cfg.response_ceiling(),
+                    touch,
+                )),
+                Some(_) => {
+                    let ir = decode_upstream_sse(
+                        resp.into_chunks(),
+                        self.cfg.response_ceiling(),
+                        model_restore(&req.model, &self.cfg.model_map),
+                        touch,
+                    );
+                    Ok(frame_chunks(translate_read_calls(ir, translation)))
+                }
+            };
         }
         let ir = to_ir_stream(
             resp,
@@ -1540,20 +1891,7 @@ impl Provider for OpenAiProvider {
             touch,
         )
         .await?;
-        // Frame each chunk through the compat bridge's raw-first emitter:
-        // no expect() in a byte-forwarding function, and chunk JSON keeps one
-        // source, so relayed and transcoded frames cannot drift in shape.
-        let framed = ir
-            .map_ok(|c| {
-                let mut buf = bytes::BytesMut::with_capacity(256);
-                opencode2api_dialects::chat::append_chunk_frame(&c, &mut buf);
-                buf.freeze()
-            })
-            .map_err(|e| e.to_string())
-            .chain(futures_util::stream::iter(vec![Ok(
-                bytes::Bytes::from_static(opencode2api_kit::sse::DONE_FRAME),
-            )]));
-        Ok(framed.boxed())
+        Ok(frame_chunks(translate_read_calls(ir, translation)))
     }
 
     /// The catalogue, as an ADVISORY list: served from cache within
@@ -1608,29 +1946,33 @@ impl Provider for OpenAiProvider {
 
     /// The protocol relay: TypeSafe System One decisions, verbatim in and out.
     ///
-    /// The whole OpenCode identity rides through `decorate` (this is the smoke
-    /// the free-tier gate reads), but the BODY is the client's: `state` and
-    /// typed `questions` are not IR, so nothing here rewrites, tools-pins, or
-    /// forces a stream flag. Non-2xx passes through as received — a schema 422
-    /// and the vendor's `ModelProtocolUnsupported` are the client's answers.
+    /// The whole OpenCode identity rides through `identity_headers` (this is the
+    /// smoke the free-tier gate reads), but the BODY is the client's: `state`
+    /// and typed `questions` are not IR, so nothing here rewrites, tools-pins,
+    /// or forces a stream flag. Non-2xx passes through as received — a schema
+    /// 422 and the vendor's `ModelProtocolUnsupported` are the client's
+    /// answers.
     ///
-    /// No credential cooldown: the free tier gates this surface by protocol and
-    /// identity, not by a metered key (a request with no `Authorization` at all
-    /// is answered), so a 401/429 here is not evidence about the pooled key.
+    /// No credential cooldown: the free tier gates this surface by protocol
+    /// and identity, not by a metered key (a request with no `Authorization`
+    /// at all is answered), so a 401/429 here is not evidence about the
+    /// pooled key.
     async fn relay_protocol(
         &self,
         body: bytes::Bytes,
-        ctx: &CallContext<'_>,
+        _ctx: &CallContext<'_>,
     ) -> Result<RawReply, ProviderError> {
-        let (client, lane) = self.transport.lane_client()?;
-        let req = client
-            .post(self.systemone_url.clone())
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::ACCEPT, "application/json")
-            .body(body);
-        let (req, _slot) = self.decorate(req, None, ctx)?;
-        let resp = req.send().await.map_err(|e| {
-            match opencode2api_transport::classify_send(&e) {
+        let lane = self.transport.lane()?;
+        let mut headers = self.identity_headers();
+        headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        self.authenticate(&mut headers, None)?;
+        let req = opencode2api_transport::vendor::VendorRequest::post(
+            self.systemone_url.clone(),
+            headers,
+            body,
+        );
+        let resp = self.vendor.send(&lane, req).await.map_err(|e| {
+            match e.fault {
                 opencode2api_transport::SendFault::Lane => lane.note_failure(),
                 opencode2api_transport::SendFault::Slow => {
                     lane.note_slow();
@@ -1638,17 +1980,41 @@ impl Provider for OpenAiProvider {
                 }
                 opencode2api_transport::SendFault::Other => {}
             }
-            ProviderError::from(e)
+            e.into_provider_error()
         })?;
         // Headers arrived: the tunnel is proven whatever the vendor decided
         // about the body.
         lane.note_healthy();
         lane.note_used();
-        RawReply::from_upstream(UpstreamResponse(resp), self.cfg.response_ceiling()).await
+        RawReply::from_upstream(resp, self.cfg.response_ceiling()).await
     }
 }
 
-/// The client name to restore only when the vendor returns the exact model
+/// Frame IR chunks through the compat bridge's raw-first emitter: no expect()
+/// in a byte-forwarding function, and chunk JSON keeps one source, so relayed
+/// and transcoded frames cannot drift in shape.
+fn frame_chunks(ir: ChatStream) -> ChunkStream {
+    ir.map_ok(|c| {
+        let mut buf = bytes::BytesMut::with_capacity(256);
+        opencode2api_dialects::chat::append_chunk_frame(&c, &mut buf);
+        buf.freeze()
+    })
+    .map_err(|e| e.to_string())
+    .chain(futures_util::stream::iter(vec![Ok(
+        bytes::Bytes::from_static(opencode2api_kit::sse::DONE_FRAME),
+    )]))
+    .boxed()
+}
+
+/// The read-tool translation this request's RESPONSES need: derived from the
+/// caller's own tool declarations, before the gateway appends its `read`.
+fn request_read_translation(req: &ChatRequest) -> Option<ReadTarget> {
+    let value = req.to_value();
+    let tools = value.get("tools").and_then(Value::as_array)?;
+    read_target_from_tools(tools)
+}
+
+/// The client name to restore only when the vendor returns the exact model/// The client name to restore only when the vendor returns the exact model
 /// selected for this request. `None` means the request was not alias-rewritten.
 #[derive(Clone)]
 struct ModelRestore {
@@ -2309,6 +2675,8 @@ mod tests {
                 api_keys: keys.iter().map(|k| (*k).to_string()).collect(),
                 model_map: Default::default(),
                 max_response_bytes: None,
+                max_inflight: None,
+                models_url: None,
             },
         )
         .unwrap()
@@ -2326,6 +2694,8 @@ mod tests {
                     .map(|(alias, vendor)| ((*alias).into(), (*vendor).into()))
                     .collect(),
                 max_response_bytes: None,
+                max_inflight: None,
+                models_url: None,
             },
         )
     }
@@ -2592,6 +2962,8 @@ mod tests {
             api_keys: vec!["a".into(), " b ".into(), String::new(), "c".into()],
             model_map: Default::default(),
             max_response_bytes: None,
+            max_inflight: None,
+            models_url: None,
         };
         assert_eq!(
             cfg.credentials(),
@@ -2620,9 +2992,62 @@ mod tests {
                 model_map: Default::default(),
                 api_keys: Vec::new(),
                 max_response_bytes: None,
+                max_inflight: None,
+                models_url: None,
             },
         )
         .expect("test base urls parse")
+    }
+
+    /// The vendor serves chat on the new root and the model LIST only on the
+    /// legacy one (measured 2026-10-25: `/inference/openai/v1/models` → 404,
+    /// `/inference/v1/models` → 200), so the two URLs must be able to sit on
+    /// different roots. An explicit `provider.models_url` wins over the
+    /// vendor's sibling rule, and an unrelated base keeps `{base}/models`.
+    #[test]
+    fn the_catalogue_can_live_on_a_different_root_than_chat() {
+        let p = provider("https://opencode.ai/inference/openai/v1");
+        assert_eq!(
+            p.chat_url.as_str(),
+            "https://opencode.ai/inference/openai/v1/chat/completions"
+        );
+        assert_eq!(
+            p.models_url().as_str(),
+            "https://opencode.ai/inference/v1/models",
+            "the catalogue keeps the legacy root the vendor actually serves"
+        );
+
+        let explicit = OpenAiProvider::new(
+            opencode2api_transport::Transport::direct(&opencode2api_kit::ServerConfig::default()),
+            ServiceConfig {
+                name: "openai".into(),
+                base_url: "https://opencode.ai/inference/openai/v1".into(),
+                api_key: None,
+                api_keys: Vec::new(),
+                model_map: Default::default(),
+                max_response_bytes: None,
+                max_inflight: None,
+                models_url: Some("https://catalogue.example/v1/models".into()),
+            },
+        )
+        .expect("both urls parse");
+        assert_eq!(
+            explicit.models_url().as_str(),
+            "https://catalogue.example/v1/models",
+            "provider.models_url is authoritative"
+        );
+        assert_eq!(
+            explicit.chat_url.as_str(),
+            "https://opencode.ai/inference/openai/v1/chat/completions",
+            "and it does not move chat"
+        );
+
+        let other = provider("https://api.example.com/v1");
+        assert_eq!(
+            other.models_url().as_str(),
+            "https://api.example.com/v1/models",
+            "another vendor keeps the ordinary derived shape"
+        );
     }
 
     #[test]
@@ -2669,10 +3094,57 @@ mod tests {
                     api_keys: Vec::new(),
                     model_map: Default::default(),
                     max_response_bytes: None,
+                    max_inflight: None,
+                    models_url: None,
                 },
             )
             .is_err()
         );
+    }
+
+    /// LIVE: the one arm that proves the whole vendor leg end to end — the
+    /// body this provider builds, sent through the BoringSSL dialer to the
+    /// real vendor, comes back `200`. Ignored because it needs network and a
+    /// free-tier quota; run it deliberately:
+    /// `cargo test -p service --lib live_vendor_leg -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "live vendor call: network and a free-tier quota"]
+    async fn live_vendor_leg_answers_the_built_body() {
+        let p = zen_provider();
+        let req: ChatRequest = serde_json::from_value(json!({
+            "model": "deepseek-v4.1-flash-free",
+            "messages": [{"role": "user", "content": "say hi in one word"}]
+        }))
+        .unwrap();
+        let body = p.to_upstream_body(&req);
+        let mut headers = p.identity_headers();
+        headers.push(("Content-Type".into(), "application/json".into()));
+        p.authenticate(&mut headers, None)
+            .expect("public credential");
+        let transport =
+            opencode2api_transport::Transport::direct(&opencode2api_kit::ServerConfig::default());
+        let vendor = transport.vendor_client(None).expect("TLS context");
+        let lane = transport.lane().expect("lane");
+        let request = opencode2api_transport::vendor::VendorRequest::post(
+            p.chat_url.clone(),
+            headers,
+            serde_json::to_vec(&body).expect("body serializes").into(),
+        );
+        let resp = vendor.send(&lane, request).await.expect("send");
+        let status = resp.status().as_u16();
+        let log_id = resp
+            .headers()
+            .get("x-opencode-log-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let bytes = resp.body_bytes().await.expect("body");
+        let text = String::from_utf8_lossy(&bytes);
+        println!(
+            "STATUS {status} LOGID {log_id} BODY {}",
+            &text[..text.len().min(200)]
+        );
+        assert_eq!(status, 200, "{text}");
     }
 
     #[test]
@@ -2714,6 +3186,8 @@ mod tests {
                 api_keys: Vec::new(),
                 model_map: map,
                 max_response_bytes: None,
+                max_inflight: None,
+                models_url: None,
             },
         )
         .unwrap();
@@ -2746,16 +3220,16 @@ mod tests {
         .unwrap();
         let p = provider("https://api.deepseek.com");
         let body = p.to_upstream_body(&req);
-        // A client-supplied `tools` array triggers the steering system note at
-        // index 0, shifting every caller message by one — the replay contract
-        // itself is untouched.
+        // Every body leads with the harness system prompt, and a client-supplied
+        // `tools` array adds the steering note after it: caller messages start
+        // at index 2. The replay contract itself is untouched.
         assert_eq!(
-            body["messages"][2]["reasoning_content"], "I should call get_weather…",
+            body["messages"][3]["reasoning_content"], "I should call get_weather…",
             "reasoning_content must survive the relay byte-for-byte"
         );
-        assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(body["messages"][3]["tool_calls"][0]["id"], "call_1");
         assert_eq!(
-            body["messages"][3]["role"], "tool",
+            body["messages"][4]["role"], "tool",
             "unknown roles pass through"
         );
         assert_eq!(
@@ -2767,12 +3241,17 @@ mod tests {
             .as_array()
             .expect("tools array")
             .iter()
-            .map(|t| t["function"]["name"].as_str().expect("chat spelling"))
+            .map(|t| super::tool_name(t).expect("tool name"))
             .collect();
         assert_eq!(
             names,
-            ["shell", "read"],
-            "the gate pair replaces client tools"
+            ["get_weather", "read"],
+            "the caller's tool rides; the gate's bare read is appended"
+        );
+        assert_eq!(
+            body["messages"][1]["content"],
+            "The `read` entry in `tools` is a gateway placeholder the caller cannot execute: do not call it. Every other tool in `tools` was declared by the caller and may be called normally.",
+            "a caller with no file-read tool gets the placeholder note"
         );
     }
 
@@ -2785,26 +3264,35 @@ mod tests {
             opencode2api_transport::Transport::direct(&opencode2api_kit::ServerConfig::default()),
             ServiceConfig {
                 name: "openai".into(),
-                base_url: "https://opencode.ai/inference/v1".into(),
+                base_url: "https://opencode.ai/inference/openai/v1".into(),
                 api_key: Some("public".into()),
                 api_keys: Vec::new(),
                 model_map: Default::default(),
                 max_response_bytes: None,
+                max_inflight: None,
+                models_url: None,
             },
         )
         .expect("a literal https base parses")
     }
 
-    /// A request decorated the way `send()` decorates it, for header asserts.
-    fn decorated(profile: &OpenAiProvider) -> reqwest::Request {
-        let headers = http::HeaderMap::new();
-        let ctx = CallContext::new(9001, Some(&headers));
+    /// The headers `send()` writes, in the order it hands them to the vendor
+    /// leg (the leg sorts them byte-wise on the wire).
+    fn decorated(profile: &OpenAiProvider) -> Vec<(String, String)> {
+        let mut headers = profile.identity_headers();
         profile
-            .decorate(reqwest::Client::new().post("https://x.test"), None, &ctx)
-            .expect("a configured credential authenticates")
-            .0
-            .build()
-            .expect("request builds")
+            .authenticate(&mut headers, None)
+            .expect("a configured credential authenticates");
+        headers
+    }
+
+    /// Look a header up the way the wire will see it (names are case-sensitive
+    /// here on purpose: the vendor leg preserves the caller's case).
+    fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     }
 
     /// One SSE record per upstream chunk, the shape transport delivers.
@@ -2829,29 +3317,17 @@ mod tests {
     #[test]
     fn opencode_identity_headers_follow_the_2x_profile() {
         let first = decorated(&zen_provider());
-        let h = first.headers();
+        let h = &first;
         // Version-PINNED now: the gate pairs the agent string with the tools
         // fingerprint, so a loose shape check would admit a version the
         // fingerprint file does not vouch for.
-        let user_agent = h
-            .get("user-agent")
-            .and_then(|v| v.to_str().ok())
-            .expect("user-agent header");
+        let user_agent = header(h, "User-Agent").expect("user-agent header");
         assert_eq!(user_agent, OPENCODE_UA, "{user_agent}");
-        assert_eq!(
-            h.get("x-opencode-client").and_then(|v| v.to_str().ok()),
-            Some("cli"),
-        );
-        let project = h
-            .get("x-opencode-project")
-            .and_then(|v| v.to_str().ok())
-            .expect("project header");
+        assert_eq!(header(h, "x-opencode-client"), Some("cli"));
+        let project = header(h, "x-opencode-project").expect("project header");
         assert_eq!(project.len(), 40, "{project}");
         assert!(project.bytes().all(|b| b.is_ascii_hexdigit()), "{project}");
-        let session = h
-            .get("x-opencode-session")
-            .and_then(|v| v.to_str().ok())
-            .expect("session header");
+        let session = header(h, "x-opencode-session").expect("session header");
         let tail = session.strip_prefix("ses_").expect("ses_ prefix");
         assert_eq!(tail.len(), 26, "{session}");
         assert!(
@@ -2862,15 +3338,17 @@ mod tests {
             tail[12..].bytes().all(|b| b.is_ascii_alphanumeric()),
             "{session}"
         );
-        assert_eq!(h.get("x-session-affinity"), h.get("x-opencode-session"));
-        assert_eq!(h.get("x-session-id"), h.get("x-opencode-session"));
         assert_eq!(
-            h.get("authorization").and_then(|v| v.to_str().ok()),
-            Some("Bearer public"),
+            header(h, "x-session-affinity"),
+            header(h, "x-opencode-session")
         );
-        for absent in ["x-opencode-request", "traceparent", "b3"] {
+        assert_eq!(header(h, "x-session-id"), header(h, "x-opencode-session"));
+        assert_eq!(header(h, "Authorization"), Some("Bearer public"));
+        // The genuine client sends no correlation id, and a per-call UUID in
+        // a shape-checked request is noise this proxy must not add.
+        for absent in ["x-request-id", "x-opencode-request", "traceparent", "b3"] {
             assert!(
-                !h.contains_key(absent),
+                header(h, absent).is_none(),
                 "{absent} is not part of the 2.x profile"
             );
         }
@@ -2890,18 +3368,12 @@ mod tests {
         // Session and project are minted per construction: no genuine
         // client's session is borrowed.
         let second = decorated(&zen_provider());
-        assert_ne!(
-            second.headers().get("x-opencode-session"),
-            h.get("x-opencode-session")
-        );
-        assert_ne!(
-            second.headers().get("x-opencode-project"),
-            h.get("x-opencode-project")
-        );
+        assert_ne!(header(&second, "x-opencode-session"), Some(session));
+        assert_ne!(header(&second, "x-opencode-project"), Some(project));
     }
 
     #[test]
-    fn upstream_body_forces_stream_and_injects_decoys() {
+    fn upstream_body_forces_stream_and_appends_the_gate_read() {
         let req: ChatRequest = serde_json::from_value(json!({
             "model": "m", "messages": [{"role": "user", "content": "x"}]
         }))
@@ -2909,95 +3381,355 @@ mod tests {
         let body = provider("https://x.test/v1").to_upstream_body(&req);
         assert_eq!(body["stream"], true, "the gate 403s a buffered request");
         assert_eq!(body["stream_options"]["include_usage"], true);
-        let names: Vec<&str> = body["tools"]
-            .as_array()
-            .expect("the gate reads the tools array")
-            .iter()
-            .map(|tool| tool["function"]["name"].as_str().expect("chat spelling"))
-            .collect();
-        assert_eq!(names, ["shell", "read"], "exactly the gate pair");
+        assert_eq!(
+            body["tools"],
+            json!([{ "name": "read" }]),
+            "zero caller tools still needs the bare read entry the gate looks for"
+        );
         assert!(
             body.get("tool_choice").is_none(),
             "tool_choice:'none' is REFUSED by the gate; it is never sent"
         );
+        assert_eq!(
+            body["messages"][0]["content"],
+            super::env_block(),
+            "the synthesized <env> block is what the prompt check reads"
+        );
+        assert!(
+            body["messages"][1]["content"]
+                .as_str()
+                .is_some_and(|note| note.contains("gateway placeholder")),
+            "a caller with no file-read tool is told the read entry is a placeholder"
+        );
     }
 
+    /// The caller's tools are the caller's: foreign names ride verbatim, and a
+    /// bare `read` is appended only because the gate requires one.
     #[test]
-    fn client_tools_are_replaced_and_tool_choice_stripped() {
+    fn caller_tools_are_relayed_and_read_is_appended() {
+        let weather = json!({"type": "function", "function": {
+            "name": "get_weather", "description": "w",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+        }});
         let req: ChatRequest = serde_json::from_value(json!({
             "model": "m",
             "messages": [{"role": "user", "content": "x"}],
             "tool_choice": "none",
-            "tools": [{"type": "function", "function": {"name": "get_weather"}}]
+            "tools": [weather.clone()]
         }))
         .unwrap();
         let body = provider("https://x.test/v1").to_upstream_body(&req);
-        let names: Vec<&str> = body["tools"]
-            .as_array()
-            .expect("tools array")
-            .iter()
-            .map(|tool| tool["function"]["name"].as_str().expect("chat spelling"))
-            .collect();
         assert_eq!(
-            names,
-            ["shell", "read"],
-            "the gate pair replaces client tools"
+            body["tools"],
+            json!([weather, { "name": "read" }]),
+            "the caller's tool is untouched and read is appended"
         );
         assert!(
             body.get("tool_choice").is_none(),
             "a client-pinned tool_choice would 403 the request upstream"
         );
+        assert!(
+            body["messages"][1]["content"]
+                .as_str()
+                .is_some_and(|note| note.contains("gateway placeholder")),
+            "no translatable read tool, so the note rides"
+        );
     }
 
+    /// Foreign names beside a caller-declared `read` all survive: the gate
+    /// reads the name `read` and nothing else (measured 2026-10-25).
     #[test]
-    fn genuine_shell_read_client_tools_pass_through_untouched() {
-        let pinned = GATE_TOOLS_ARRAY.as_array().expect("pinned gate pair");
-        let shell = pinned
-            .iter()
-            .find(|tool| tool["function"]["name"] == "shell")
-            .expect("pinned shell")
-            .clone();
-        let read = pinned
-            .iter()
-            .find(|tool| tool["function"]["name"] == "read")
-            .expect("pinned read")
-            .clone();
-        // Reordered: read first, shell second. The pass-through branch matches
-        // by name + parameters, so client order is preserved as sent.
-        let client_tools = Value::Array(vec![read, shell]);
+    fn foreign_tool_names_survive_beside_read() {
+        let tools = json!([
+            {"name": "bash", "parameters": {"type": "object"}},
+            {"name": "str_replace_editor"},
+            {"name": "read", "parameters": {}}
+        ]);
         let req: ChatRequest = serde_json::from_value(json!({
             "model": "m",
             "messages": [{"role": "user", "content": "x"}],
             "tool_choice": "auto",
-            "tools": client_tools.clone()
+            "tools": tools.clone()
         }))
         .unwrap();
         let body = provider("https://x.test/v1").to_upstream_body(&req);
+        assert_eq!(body["tools"], tools, "the array is relayed verbatim");
+        assert_eq!(body["tool_choice"], "auto", "'auto' is not refused");
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 2, "env block + caller turn; no note");
+        assert_eq!(messages[0]["content"], super::env_block());
+        assert_eq!(messages[1]["role"], "user");
+    }
+
+    /// Environment policy, in the measured order: an existing valid pair
+    /// (in ANY system message) rides untouched; otherwise the block lands in
+    /// the FIRST system message; no system message means one is created.
+    #[test]
+    fn chat_body_puts_the_env_block_in_a_system_message() {
+        let bare: ChatRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let body = provider("https://x.test/v1").to_upstream_body(&bare);
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], super::env_block());
+        assert!(super::has_env_block(
+            messages[0]["content"].as_str().unwrap()
+        ));
+
+        // A caller system turn WITHOUT the pair gets it appended, not a second
+        // system message beside it.
+        let with_system: ChatRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "hi"}
+            ]
+        }))
+        .unwrap();
+        let body = provider("https://x.test/v1").to_upstream_body(&with_system);
+        let messages = body["messages"].as_array().expect("messages");
         assert_eq!(
-            body["tools"], client_tools,
-            "genuine shell/read satisfy the gate, so the client array rides untouched"
+            messages.len(),
+            3,
+            "env+note system turns, then the caller's"
         );
-        let names: Vec<&str> = body["tools"]
-            .as_array()
-            .expect("tools array")
-            .iter()
-            .map(|tool| tool["function"]["name"].as_str().expect("chat spelling"))
-            .collect();
-        assert_eq!(names, ["read", "shell"], "client order preserved");
+        let content = messages[0]["content"].as_str().expect("string content");
+        assert!(content.starts_with("be brief"), "{content}");
+        assert!(super::has_env_block(content), "{content}");
+
+        // A valid pair in a NON-first system message is enough.
+        let later: ChatRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "ctx <env>Working directory: /root</env>"}
+            ]
+        }))
+        .unwrap();
+        let body = provider("https://x.test/v1").to_upstream_body(&later);
         assert_eq!(
-            body["tool_choice"], "auto",
-            "'auto' is not refused by the gate, so it is relayed"
+            body["messages"][2]["content"], "ctx <env>Working directory: /root</env>",
+            "a system message already carrying the pair is untouched"
         );
+
+        // A caller's INVALID first pair must not win: ours goes in front of it.
+        let invalid: ChatRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "<env x=\"1\">old</env>"},
+                {"role": "user", "content": "hi"}
+            ]
+        }))
+        .unwrap();
+        let body = provider("https://x.test/v1").to_upstream_body(&invalid);
+        let content = body["messages"][0]["content"].as_str().expect("content");
+        assert!(content.starts_with(&super::env_block()), "{content}");
+        assert!(super::has_env_block(content), "{content}");
+    }
+
+    /// No cap is invented: absent stays absent, the caller's value is kept,
+    /// and the old spelling is renamed.
+    #[test]
+    fn no_output_cap_is_invented() {
+        let bare: ChatRequest = serde_json::from_value(json!({
+            "model": "m", "messages": []
+        }))
+        .unwrap();
+        let body = provider("https://x.test/v1").to_upstream_body(&bare);
+        assert!(
+            body.get("max_completion_tokens").is_none(),
+            "the gate treats the cap as optional"
+        );
+
+        let capped: ChatRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [], "max_completion_tokens": 64
+        }))
+        .unwrap();
         assert_eq!(
-            body["messages"].as_array().expect("messages").len(),
-            1,
-            "no steering note rides a pass-through"
+            provider("https://x.test/v1").to_upstream_body(&capped)["max_completion_tokens"],
+            64
         );
+
+        let old: ChatRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [], "max_tokens": 256
+        }))
+        .unwrap();
+        let body = provider("https://x.test/v1").to_upstream_body(&old);
+        assert_eq!(body["max_completion_tokens"], 256);
+        assert!(body.get("max_tokens").is_none());
+
+        let both: ChatRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [], "max_tokens": 256, "max_completion_tokens": 64
+        }))
+        .unwrap();
+        let body = provider("https://x.test/v1").to_upstream_body(&both);
+        assert_eq!(body["max_completion_tokens"], 64);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    // ── read-call translation ────────────────────────────────────────────
+
+    fn claude_read_tool() -> Value {
+        json!({"type": "function", "function": {
+            "name": "Read", "description": "read a file",
+            "parameters": {"type": "object", "properties": {
+                "file_path": {"type": "string"},
+                "offset": {"type": "number"}
+            }}
+        }})
     }
 
     #[test]
-    fn gate_pair_with_tool_choice_none_strips_only_choice() {
-        let client_tools = GATE_TOOLS_ARRAY.clone();
+    fn a_caller_read_tool_is_recognized_and_mapped() {
+        let target = super::read_target(&claude_read_tool()).expect("Read is a read tool");
+        assert_eq!(target.name, "Read");
+        assert_eq!(target.path_param, "file_path");
+        assert!(target.keeps_offset);
+        assert!(!target.keeps_limit);
+        assert_eq!(
+            super::translate_read_arguments(r#"{"path":"a.txt","offset":2,"limit":5}"#, &target),
+            r#"{"file_path":"a.txt","offset":2}"#,
+            "path is renamed, offset kept, limit dropped when undeclared"
+        );
+        assert!(
+            super::read_target(&json!({"function": {"name": "bash", "parameters": {"properties": {"command": {}}}}})).is_none(),
+            "unrelated tools are never renamed into"
+        );
+        assert!(
+            super::read_target_from_tools(&[json!({"name": "read"})]).is_none(),
+            "the gate's own lowercase read needs no translation"
+        );
+        let target = super::read_target(&json!({"function": {
+            "name": "read_file", "parameters": {"properties": {"path": {"type": "string"}}}
+        }}))
+        .expect("Cline's read_file is recognized");
+        assert_eq!(target.path_param, "path");
+    }
+
+    #[test]
+    fn folded_read_calls_are_renamed_into_the_callers_tool() {
+        let target = super::read_target(&claude_read_tool());
+        let mut completion = Completion {
+            id: "x".into(),
+            model: "m".into(),
+            text: String::new(),
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"a.txt"}"#.into(),
+            }],
+            raw: Some(json!({"id": "x", "choices": []})),
+            reasoning: None,
+            refusal: None,
+        };
+        super::translate_completion_calls(&mut completion, target.as_ref());
+        assert_eq!(completion.tool_calls[0].name, "Read");
+        assert_eq!(
+            completion.tool_calls[0].arguments,
+            r#"{"file_path":"a.txt"}"#
+        );
+        assert!(
+            completion.raw.is_none(),
+            "the vendor frame would re-emit the untranslated name"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_read_calls_are_buffered_and_translated_before_the_terminal() {
+        use futures_util::StreamExt;
+        let target = super::read_target(&claude_read_tool());
+        let chunks: Vec<Result<ChatChunk, ProviderError>> = vec![
+            Ok(ChatChunk {
+                id: "c".into(),
+                model: "m".into(),
+                text: "hi".into(),
+                finish_reason: None,
+                usage: None,
+                tool_calls: Vec::new(),
+                raw: None,
+                reasoning: String::new(),
+                refusal: String::new(),
+            }),
+            Ok(ChatChunk {
+                id: "c".into(),
+                model: "m".into(),
+                text: String::new(),
+                finish_reason: None,
+                usage: None,
+                tool_calls: vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("read".into()),
+                    arguments: String::new(),
+                }],
+                raw: None,
+                reasoning: String::new(),
+                refusal: String::new(),
+            }),
+            Ok(ChatChunk {
+                id: "c".into(),
+                model: "m".into(),
+                text: String::new(),
+                finish_reason: None,
+                usage: None,
+                tool_calls: vec![ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    arguments: r#"{"path":"a.txt"}"#.into(),
+                }],
+                raw: None,
+                reasoning: String::new(),
+                refusal: String::new(),
+            }),
+            Ok(ChatChunk {
+                id: "c".into(),
+                model: "m".into(),
+                text: String::new(),
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+                tool_calls: Vec::new(),
+                raw: None,
+                reasoning: String::new(),
+                refusal: String::new(),
+            }),
+        ];
+        let out = super::translate_read_calls(futures_util::stream::iter(chunks), target)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        let names: Vec<Option<&str>> = out
+            .iter()
+            .flat_map(|c| c.tool_calls.iter().map(|d| d.name.as_deref()))
+            .collect();
+        assert_eq!(
+            names,
+            [Some("Read")],
+            "the fragmented call collapses to one delta"
+        );
+        let call = out
+            .iter()
+            .find(|c| !c.tool_calls.is_empty())
+            .expect("translated call");
+        assert_eq!(call.tool_calls[0].arguments, r#"{"file_path":"a.txt"}"#);
+        let finish_at = out.iter().position(|c| c.finish_reason.is_some()).unwrap();
+        let call_at = out.iter().position(|c| !c.tool_calls.is_empty()).unwrap();
+        assert!(call_at < finish_at, "the call precedes the terminal chunk");
+        assert_eq!(out[0].text, "hi", "text passes through untouched");
+    }
+
+    #[test]
+    fn tool_choice_none_is_stripped_and_the_callers_tools_stay() {
+        let client_tools = json!([
+            {"name": "bash", "parameters": {"type": "object"}},
+            {"name": "read", "parameters": {}}
+        ]);
         let req: ChatRequest = serde_json::from_value(json!({
             "model": "m",
             "messages": [{"role": "user", "content": "x"}],
@@ -3008,16 +3740,16 @@ mod tests {
         let body = provider("https://x.test/v1").to_upstream_body(&req);
         assert!(
             body.get("tool_choice").is_none(),
-            "the gate refuses 'none' outright, even on a genuine-tools request"
+            "the gate refuses 'none' outright"
         );
         assert_eq!(
             body["tools"], client_tools,
-            "only the choice is dropped: the genuine pair rides untouched"
+            "only the choice is dropped: the caller's array rides untouched"
         );
         assert_eq!(
             body["messages"].as_array().expect("messages").len(),
-            1,
-            "no steering note when the gate is already satisfied"
+            2,
+            "env block plus the caller's turn; no note when the caller declared read"
         );
     }
 
@@ -3075,13 +3807,11 @@ mod tests {
         assert_eq!(outputs[0]["output"], "done");
 
         let tools = body["tools"].as_array().expect("flat tools");
-        assert_eq!(tools[0]["type"], "function");
-        assert_eq!(tools[0]["name"], "shell", "flat spelling");
-        assert!(
-            tools[0].get("function").is_none(),
-            "flat spelling has no nesting"
+        assert_eq!(
+            tools,
+            &vec![json!({ "name": "read" })],
+            "the gate's bare read"
         );
-        assert_eq!(tools[1]["name"], "read");
         assert!(
             body.get("max_tokens").is_none(),
             "max_tokens is a chat spelling the responses API rejects"
@@ -3113,8 +3843,11 @@ mod tests {
         assert!(body.get("messages").is_some(), "chat style keeps messages");
         assert!(body.get("input").is_none());
         let tools = body["tools"].as_array().expect("chat tools");
-        assert_eq!(tools[0]["function"]["name"], "shell", "chat spelling");
-        assert_eq!(tools[1]["function"]["name"], "read");
+        assert_eq!(
+            tools,
+            &vec![json!({ "name": "read" })],
+            "the gate's bare read"
+        );
         assert_eq!(body["temperature"], 0.7, "chat extras pass through");
     }
 

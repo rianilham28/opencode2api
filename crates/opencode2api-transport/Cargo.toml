@@ -19,6 +19,16 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
+boring = { workspace = true }
+tokio-boring = { workspace = true }
+async-compression = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+async-stream = { workspace = true }
+webpki-root-certs = { workspace = true }
+http = { workspace = true }
 
 [dev-dependencies]
+md5 = "0.7"
 metrics-util = { version = "0.20.4", features = ["debugging"] }

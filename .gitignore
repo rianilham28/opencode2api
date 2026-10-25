@@ -8,3 +8,7 @@ config.local.json
 
 # transient research scratch (durable reports live in docs/)
 /local/
+
+# Vendored BoringSSL checkout pinned to Bun's commit (scripts/fetch-boringssl.sh).
+/vendor/boringssl
+/target-linux

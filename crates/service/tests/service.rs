@@ -454,6 +454,8 @@ fn cfg_for(base: &str) -> (ServerConfig, ServiceConfig) {
         model_map: Default::default(),
         api_keys: Vec::new(),
         max_response_bytes: None,
+        max_inflight: None,
+        models_url: None,
     };
     (server, provider)
 }
@@ -478,7 +480,7 @@ fn client_for(cfg: &ServerConfig) -> std::sync::Arc<opencode2api_transport::Tran
 const SSE_STREAM: &str = "data: {\"id\":\"c1\",\"model\":\"m\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\ndata: [DONE]\ndata: {\"cost\":0.9}";
 
 #[tokio::test]
-async fn chat_mode_and_request_id_reach_every_upstream_surface() {
+async fn chat_mode_reaches_every_upstream_surface_and_adds_no_request_id() {
     // The catalogue filter only lets `-free` ids through; chat requests for
     // other ids still forward (upstream's answer stays honest).
     const MODELS: &str = r#"{"object":"list","data":[{"id":"m-free","object":"model"}]}"#;
@@ -496,6 +498,9 @@ async fn chat_mode_and_request_id_reach_every_upstream_surface() {
     ))
     .await;
 
+    // The caller's id is recorded locally (logs, terminal record) and must
+    // NOT travel upstream: the genuine client sends no x-request-id, and the
+    // request's shape is part of what upstream checks.
     let buffered = client()
         .post(format!("http://{proxy}/v1/chat/completions"))
         .header("x-request-id", "7001")
@@ -534,19 +539,17 @@ async fn chat_mode_and_request_id_reach_every_upstream_surface() {
     assert_eq!(request_target(&heads[0]), "/v1/chat/completions");
     assert_eq!(request_target(&heads[1]), "/v1/chat/completions");
     assert_eq!(request_target(&heads[2]), "/v1/models");
-    // The opencode profile answers every request with `*/*` — the gate does
-    // not read Accept, so there is no per-mode choice to make.
-    assert_eq!(header_value(&heads[0], "accept"), Some("*/*"));
-    assert_eq!(header_value(&heads[1], "accept"), Some("*/*"));
-    assert_eq!(header_value(&heads[0], "x-request-id"), Some("7001"));
-    assert_eq!(header_value(&heads[1], "x-request-id"), Some("7002"));
-    assert_eq!(header_value(&heads[2], "x-request-id"), Some("7003"));
-    for (head, request_id) in [
-        (&heads[0], "7001"),
-        (&heads[1], "7002"),
-        (&heads[2], "7003"),
-    ] {
-        assert_eq!(header_value_count(head, "x-request-id"), 1, "{request_id}");
+    for head in heads.iter() {
+        // The vendor leg writes the client's own default block: `*/*` on
+        // every request, no per-mode Accept choice.
+        assert_eq!(header_value(head, "accept"), Some("*/*"));
+        for absent in ["x-request-id", "b3", "traceparent"] {
+            assert_eq!(
+                header_value_count(head, absent),
+                0,
+                "{absent} is not part of the genuine request shape"
+            );
+        }
     }
     // The vendor gate 403s a buffered upstream request, so even the buffered
     // client's turn is forwarded with stream forced on.
@@ -561,7 +564,7 @@ async fn chat_mode_and_request_id_reach_every_upstream_surface() {
 }
 
 #[tokio::test]
-async fn models_without_configured_credentials_preserve_inbound_request_id() {
+async fn models_without_configured_credentials_send_no_correlation_header() {
     // A models() listing is filtered to `-free` ids, so the fixture uses one.
     const MODELS: &str = r#"{"object":"list","data":[{"id":"m-free","object":"model"}]}"#;
     let (mock, state) = mock_upstream(vec![Reply::Buffered(MODELS)]).await;
@@ -590,8 +593,14 @@ async fn models_without_configured_credentials_preserve_inbound_request_id() {
     let heads = state.heads.lock();
     assert_eq!(heads.len(), 1);
     assert_eq!(request_target(&heads[0]), "/v1/models");
-    assert_eq!(header_value_count(&heads[0], "x-request-id"), 1);
-    assert_eq!(header_value(&heads[0], "x-request-id"), Some("7004"));
+    // The free catalogue needs no credential, and the inbound id is still not
+    // relayed: neither header belongs to the request the genuine client makes.
+    assert_eq!(header_value_count(&heads[0], "authorization"), 0);
+    assert_eq!(header_value_count(&heads[0], "x-request-id"), 0);
+    assert_eq!(
+        header_value(&heads[0], "user-agent"),
+        Some("opencode/latest/2.1.4/cli")
+    );
 }
 
 #[tokio::test]
@@ -1286,7 +1295,8 @@ async fn anthropic_media_reaches_the_upstream_as_image_and_file_parts() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let sent: Value = serde_json::from_slice(state.bodies.lock().first().unwrap()).unwrap();
-    let parts = sent["messages"][0]["content"]
+    assert_eq!(sent["messages"][0]["role"], "system", "the env block leads");
+    let parts = sent["messages"][2]["content"]
         .as_array()
         .expect("the folded turn must be a part array");
     assert_eq!(parts[0]["type"], "text");
@@ -1315,7 +1325,7 @@ async fn anthropic_media_reaches_the_upstream_as_image_and_file_parts() {
     assert_eq!(req.status(), 200);
     let doc: Value =
         serde_json::from_slice(state.bodies.lock().get(1).expect("second request")).unwrap();
-    let part = &doc["messages"][0]["content"][0];
+    let part = &doc["messages"][2]["content"][0];
     assert_eq!(part["type"], "file");
     assert_eq!(
         part["file"]["file_data"],
@@ -1355,14 +1365,15 @@ async fn chat_media_parts_reach_the_upstream_untouched() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let sent: Value = serde_json::from_slice(state.bodies.lock().first().unwrap()).unwrap();
-    let image = &sent["messages"][0]["content"][1];
+    assert_eq!(sent["messages"][0]["role"], "system", "the env block leads");
+    let image = &sent["messages"][2]["content"][1];
     assert_eq!(image["image_url"]["url"], "https://host/a.png");
     assert_eq!(image["image_url"]["detail"], "low");
     assert_eq!(
         image["image_url"]["vendor_extension"], true,
         "unparsed means a field the IR never modelled still arrives"
     );
-    let file = &sent["messages"][0]["content"][2];
+    let file = &sent["messages"][2]["content"][2];
     assert_eq!(file["type"], "file");
     assert_eq!(file["file"]["filename"], "client.pdf");
     assert_eq!(
@@ -1979,15 +1990,14 @@ async fn shards_open_more_connections_onto_one_session() {
     assert_eq!(lane.shards(), 2, "the lane really did hold two pools");
 }
 
-/// (b) A prewarmed lane's first real request rides the connection the probe
-/// opened.
+/// (b) A prewarmed lane's first real request rides a connection the warm pass
+/// opened, not one it opened itself.
 ///
-/// WHAT THIS PROVES: the probe reached the vendor, and the socket it opened
-/// was back in the client's pool by the time the first real request went out
-/// — two requests, one accept, the same `conn_id`. That is the whole point of
-/// spending a handshake off the request path, and it is a real regression
-/// net: a probe whose response was never finished could not leave a reusable
-/// connection behind.
+/// WHAT THIS PROVES: warming spends BOTH handshakes off the request path —
+/// the `reqwest` lane client's `HEAD` (lane health) and the vendor leg's
+/// TCP/TLS connect — so the first real request finds a parked socket in the
+/// pool it actually uses. The request opening a third connection would mean
+/// the warm pass warmed a stack nothing uses.
 ///
 /// WHAT IT DOES NOT PROVE, stated plainly because the tempting overclaim here
 /// is "and the probe was DRAINED". It is not, and cannot be, here. A `HEAD`
@@ -2050,16 +2060,23 @@ async fn a_prewarm_probe_opens_the_connection_the_first_request_reuses() {
         .find(|(_, head)| request_method(head) == "POST")
         .expect("the real request went to the wire");
     // The probe's HEAD is asserted PRESENT before the accept count: a missing
-    // probe and a working probe both look like "one accept", so the count
+    // probe and a working probe both look like "two accepts", so the count
     // only means something once the probe is known to have been sent.
-    assert_eq!(
+    //
+    // Two stacks, two warm sockets, and that is the contract now: the HEAD
+    // rides the `reqwest` lane client (lane health), while the request rides
+    // the VENDOR leg's warmed connection — the same host and proxy session,
+    // different client, because reqwest cannot present the handshake the
+    // vendor leg exists for. What must stay true is that the request opened
+    // no third connection.
+    assert_ne!(
         probe.0, served.0,
-        "the probe's connection must be the one the first real request rides"
+        "the probe and the request must not share a connection when they          ride different clients; seeing one means the vendor leg was bypassed"
     );
     assert_eq!(
         warm_state.accepts.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "probe and first request are one connection, not two"
+        2,
+        "one warmed socket per client stack; the request itself opened none"
     );
 
     // -- prewarm off: no probe, so the request itself opens the connection.
@@ -2715,7 +2732,7 @@ async fn systemone_relays_the_decision_body_with_the_opencode_identity() {
     assert_eq!(request_target(head), "/v1/systemone");
     assert_eq!(
         header_value(head, "user-agent"),
-        Some("opencode/latest/2.0.27/cli"),
+        Some("opencode/latest/2.1.4/cli"),
         "the gate pairs this agent string with the tools fingerprint"
     );
     assert_eq!(header_value(head, "x-opencode-client"), Some("cli"));

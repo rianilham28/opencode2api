@@ -47,6 +47,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The vendor leg's TLS is BoringSSL at the commit Bun pins, and
+      # `.cargo/config.toml` points `boring-sys` at this checkout. It is
+      # gitignored, so a fresh checkout has no tree and the build would fail
+      # here rather than ship a binary with the wrong handshake.
+      - name: Fetch pinned BoringSSL
+        run: ./scripts/fetch-boringssl.sh
+
+      # The assertion, not just the fetch: a script edit (or a checkout that
+      # a cache restored from another ref) must not publish a release built
+      # against a different BoringSSL than the one gate.yml's JA3 gate proved.
+      - name: Assert the pinned BoringSSL commit
+        run: git -C vendor/boringssl rev-parse HEAD | grep -q 41bf9b59c2ebf277a7aa427e1ecad5cc80dd4d4f
+
       # rustup reads rust-toolchain.toml on the first cargo invocation and
       # installs the pinned compiler itself; printing it makes a wrong-toolchain
       # failure visible in the log rather than mysterious in the build.
@@ -57,6 +70,15 @@ jobs:
         run: cargo build --release --locked -p service
         # --locked: a tag must ship the graph Cargo.lock pins; a manifest edit
         # that drifted the lock would build a graph nobody gate-verified.
+
+      # The shipping profile's own fingerprint check. `--release` is the point:
+      # the coordinator could be looking at a tree `boring-sys` built from its
+      # BUNDLED google BoringSSL (if BORING_BSSL_SOURCE_PATH were ever unset),
+      # and this test captures the emitted ClientHello, so a different TLS
+      # library is a red build instead of a shipped 429. cheap beside the LTO
+      # build already in this job's cache.
+      - name: Fingerprint gate (shipping profile)
+        run: cargo test --release --locked -p opencode2api-transport client_hello_is_the_genuine -- --nocapture
 
       - name: Package + checksum
         shell: bash

@@ -412,6 +412,27 @@ truth for which; README "Quick start" lists the common ones.
   generation by design. `request_timeout_secs` covers pre-handoff stream setup,
   `relay_raw` handoff, and listings; after handoff, `stream_deadline_secs`
   remains the stream ceiling.
+- **The vendor leg is a TLS identity, not a second proxy stack.**
+  `opencode2api-transport::vendor` dials the lane's exit with BoringSSL at the
+  commit Bun pins and writes HTTP/1.1 itself (caller headers byte-sorted with
+  case preserved), because upstream's 200-vs-429 verdict is on the TLS stack
+  and `reqwest`/hyper cannot carry either half of that identity. Providers ask
+  `Transport::vendor_client(cap)` for a handle and send through it; the dialer
+  never learns a vendor's payload laws (those stay in the provider), and no
+  caller builds a `reqwest` request for a gated upstream. Do not "improve" the
+  hello — no GREASE, no cipher/curve/sigalg list, no h2 ALPN: the JA3 test is
+  what holds it to the measured client, and drift must be a red test.
+  Encoded response bodies are decoded but never pooled (a codec ends before
+  the HTTP framing terminal); identity bodies are. `provider.max_inflight` is
+  the UNMEASURED concurrency ceiling — it queues, never sheds. The BODY is a
+  credential too: `chat_body` SYNTHESIZES a literal `<env>`/`</env>` pair
+  containing `Working directory:` into a SYSTEM message (any existing valid
+  pair wins; otherwise the first system message, created if absent), RELAYS
+  the caller's tools verbatim, and appends a bare `{"name":"read"}` only when
+  none is declared. Measured 2026-10-25 (extreme matrix): this leg + such a
+  body → 200; a body without the pair, without `stream:true`, or without a
+  `read` tool → 403/429. The UA is shape-only (`opencode/x/y`), the tag name
+  is exact, the path value is free, and no output cap is invented.
 - **Only transport failures are the lane's fault.** `Lane::note_failure` is
   for CONNECT and tunnel errors, plus a body that dies mid-flight. An upstream
   429 or 500 arrived THROUGH a working lane and says nothing about the exit IP

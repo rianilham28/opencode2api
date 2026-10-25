@@ -747,6 +747,8 @@ fn proxy_on(
             model_map: Default::default(),
             api_keys: Vec::new(),
             max_response_bytes: None,
+            max_inflight: None,
+            models_url: None,
         };
         let (transport, lane_probe) = match egress {
             Egress::Direct => (opencode2api_transport::Transport::direct(&server), None),

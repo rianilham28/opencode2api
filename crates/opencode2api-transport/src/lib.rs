@@ -41,6 +41,7 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 
 mod http;
+pub mod vendor;
 
 /// The clock a pool measures lane age on, and why it is a seam at all.
 ///
@@ -597,6 +598,22 @@ pub struct Lane {
     /// egress has one lane and no replacement, so a health flip there would be
     /// a signal with no mechanism behind it.
     rotatable: bool,
+    /// Where the vendored HTTP/1.1 dialer opens its TCP connection, or `None`
+    /// for direct egress. Carried here rather than rebuilt per request so the
+    /// vendor leg rides the SAME exit IP as this lane's `reqwest` clients —
+    /// one lane, one identity, whichever client dials it.
+    vendor_proxy: Option<vendor::ProxyTarget>,
+    /// Idle keep-alive connections the vendor dialer may reuse, one slot per
+    /// shard — the same sharding the `reqwest` pools carry, because
+    /// `upstream_shards` means "spread this lane over N connections" and a
+    /// vendor leg that ignored it would quietly cap concurrency at one.
+    /// Separate from the `reqwest` pools because the two clients cannot share
+    /// a socket: `reqwest` cannot speak the handshake the vendor leg exists
+    /// for.
+    vendor_idle: Mutex<Vec<Option<vendor::IdleConn>>>,
+    /// Next shard slot the vendor leg draws from. Round-robin, so sequential
+    /// requests spread over the shard count instead of pinning one socket.
+    vendor_cursor: AtomicUsize,
 }
 
 impl std::fmt::Debug for Lane {
@@ -640,6 +657,40 @@ impl Lane {
     /// How many connection pools this lane spreads its streams over.
     pub fn shards(&self) -> usize {
         self.clients.len()
+    }
+
+    /// The proxy this lane's vendor-leg connections tunnel through, if any.
+    pub(crate) fn vendor_proxy(&self) -> Option<vendor::ProxyTarget> {
+        self.vendor_proxy.clone()
+    }
+
+    /// Take the next shard's idle keep-alive connection for the vendor
+    /// dialer, with the slot it came from (which is where it goes back). A
+    /// connection parked long enough for an intermediary to have closed it is
+    /// dropped instead of handed out: a stale socket costs a failed write and
+    /// a redial, which is exactly the handshake this pool exists to save.
+    pub(crate) fn take_vendor_conn(&self) -> Option<(usize, vendor::Conn)> {
+        let slot = self.next_vendor_slot();
+        let mut idle = self.vendor_idle.lock();
+        match idle.get_mut(slot)?.take() {
+            Some(conn) if conn.since.elapsed() < vendor::IDLE_MAX => Some((slot, conn.conn)),
+            _ => None,
+        }
+    }
+
+    /// Park a connection that reached a clean EOF in its shard's slot.
+    pub(crate) fn put_vendor_conn(&self, slot: usize, conn: vendor::IdleConn) {
+        let mut idle = self.vendor_idle.lock();
+        if let Some(slot) = idle.get_mut(slot) {
+            *slot = Some(conn);
+        }
+    }
+
+    pub(crate) fn next_vendor_slot(&self) -> usize {
+        match self.clients.len() {
+            1 => 0,
+            n => self.vendor_cursor.fetch_add(1, Ordering::Relaxed) % n,
+        }
     }
 
     pub fn vendor(&self) -> &'static str {
@@ -816,6 +867,12 @@ pub struct Transport {
     /// written only from the maintenance pass, so a plain mutex over a small
     /// vector: one lock per tick is cheaper than an atomic per vendor.
     rotation_backoff: Mutex<Vec<RotationBackoff>>,
+    /// The vendor leg's TLS context, built once on first use. It is a plain
+    /// [`std::sync::OnceLock`] rather than a constructor argument so that
+    /// `Transport::direct` stays infallible for callers that never touch the
+    /// vendor leg (a provider that only uses `lane_client()`), while every
+    /// process that DOES use it builds the context before its first request.
+    vendor: std::sync::OnceLock<vendor::VendorClient>,
 }
 
 /// One vendor's rotation-failure history: how many replacements have failed
@@ -922,6 +979,9 @@ impl Transport {
             healthy: AtomicBool::new(true),
             consecutive_failures: AtomicU32::new(0),
             rotatable: false,
+            vendor_proxy: None,
+            vendor_idle: Mutex::new((0..server.upstream_shards.max(1)).map(|_| None).collect()),
+            vendor_cursor: AtomicUsize::new(0),
         });
         Arc::new(Self {
             egress: Egress::Direct(lane),
@@ -938,6 +998,7 @@ impl Transport {
             maintenance_started: AtomicBool::new(false),
             maintenance_handle: Mutex::new(None),
             rotation_backoff: Mutex::new(Vec::new()),
+            vendor: std::sync::OnceLock::new(),
         })
     }
 
@@ -976,6 +1037,7 @@ impl Transport {
                     .map(|_| RotationBackoff::default())
                     .collect(),
             ),
+            vendor: std::sync::OnceLock::new(),
         });
 
         // Only the floor is minted here. Everything above `min_lanes` is
@@ -1151,6 +1213,33 @@ impl Transport {
         })
     }
 
+    /// Build the vendor-leg dialer from this transport's connection profile.
+    ///
+    /// One per provider, not one per request: the TLS context is immutable
+    /// after construction, and the roots are parsed once. `max_inflight` is
+    /// the vendor's concurrency ceiling, which is UNMEASURED — see
+    /// `ServiceConfig::max_inflight`.
+    pub fn vendor_client(&self, max_inflight: Option<u32>) -> anyhow::Result<vendor::VendorClient> {
+        if self.vendor.get().is_none() {
+            let built = vendor::VendorClient::new(&self.server, None)?;
+            let _ = self.vendor.set(built);
+        }
+        Ok(self
+            .vendor
+            .get()
+            .expect("the vendor leg was just initialized")
+            .with_inflight_cap(max_inflight))
+    }
+
+    /// The shared TLS context. Built on first use; every handle cloned from it
+    /// differs only in its in-flight ceiling.
+    fn vendor_leg(&self) -> &vendor::VendorClient {
+        self.vendor.get_or_init(|| {
+            vendor::VendorClient::new(&self.server, None)
+                .expect("BoringSSL client context cannot fail with this static configuration")
+        })
+    }
+
     /// Convenience for call sites that do not track lane health.
     pub fn client(&self) -> Result<reqwest::Client, ProviderError> {
         Ok(self.lane()?.client().clone())
@@ -1194,6 +1283,7 @@ impl Transport {
         );
         let session = vendor.mint_session(entropy);
         let url = vendor.lane_url(&session);
+        let vendor_proxy = Some(vendor::ProxyTarget::parse(&url)?);
         // The URL dies with this scope: `Proxy::all` keeps what it needs, and
         // nothing else in this process ever holds the password again.
         let proxy = reqwest::Proxy::all(&url).map_err(|e| {
@@ -1232,6 +1322,9 @@ impl Transport {
             healthy: AtomicBool::new(true),
             consecutive_failures: AtomicU32::new(0),
             rotatable: true,
+            vendor_proxy,
+            vendor_idle: Mutex::new((0..shards).map(|_| None).collect()),
+            vendor_cursor: AtomicUsize::new(0),
         }))
     }
 
@@ -1512,6 +1605,31 @@ impl Transport {
             // A non-transport error (404, 405, a 4xx body) still proves that
             // shard's tunnel works, which is all a prewarm asks of it.
         }
+        // And the stack the requests actually ride: the vendor leg dials its
+        // own TCP + TLS (the provider's requests never touch the `reqwest`
+        // pool above), so a warm pass that skipped it would leave every first
+        // request after a rotation paying the handshake the prewarm exists to
+        // remove. No HTTP request is sent — the handshake is the cost.
+        if proved {
+            match reqwest::Url::parse(url) {
+                Ok(url) => {
+                    if let Err(e) = self.vendor_leg().prewarm(lane, &url).await {
+                        tracing::warn!(
+                            vendor = lane.vendor(),
+                            session = %lane.session(),
+                            error = %e,
+                            "vendor-leg prewarm failed; lane not adopted"
+                        );
+                        proved = false;
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    vendor = lane.vendor(),
+                    error = %e,
+                    "prewarm url is not usable; vendor leg not warmed"
+                ),
+            }
+        }
         proved
     }
 
@@ -1589,6 +1707,21 @@ impl Transport {
                     // prewarm asks of it.
                     Err(_) => {}
                 }
+            }
+            // The vendor leg's handshake, warmed the same way and for the
+            // same reason at boot as at rotation: the provider's requests ride
+            // this stack, not the `reqwest` pools above.
+            if proved
+                && let Ok(url) = reqwest::Url::parse(probe)
+                && let Err(e) = self.vendor_leg().prewarm(&lane, &url).await
+            {
+                tracing::warn!(
+                    vendor = lane.vendor(),
+                    session = %lane.session(),
+                    error = %e,
+                    "vendor-leg prewarm failed at boot"
+                );
+                proved = false;
             }
             if proved {
                 warm += 1;
@@ -1833,6 +1966,9 @@ mod tests {
             healthy: AtomicBool::new(true),
             consecutive_failures: AtomicU32::new(0),
             rotatable: true,
+            vendor_proxy: None,
+            vendor_idle: parking_lot::Mutex::new(vec![None]),
+            vendor_cursor: AtomicUsize::new(0),
         })
     }
 

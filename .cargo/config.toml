@@ -1,0 +1,13 @@
+# BoringSSL for the vendor leg comes from a checkout of the exact commit Bun
+# pins (`scripts/build/deps/boringssl.ts` in oven-sh/bun), not from whichever
+# tree `boring-sys` happens to carry: the ClientHello is the vendor identity,
+# and a drifted tree moves the fingerprint. `scripts/fetch-boringssl.sh`
+# creates the checkout; `cargo test -p opencode2api-transport`'s JA3 gate fails
+# if the tree (or Bun's pin) stops producing it.
+[env]
+BORING_BSSL_SOURCE_PATH = { value = "vendor/boringssl", relative = true, force = false }
+# Bun's fork already carries the post-quantum changes `boring-sys` would apply
+# to a stock tree (its `boring-pq.patch` fails against this commit), and none
+# of the features the other patches gate are enabled. Without this,
+# `boring-sys` aborts the build while trying to re-apply what is already there.
+BORING_BSSL_ASSUME_PATCHED = "1"

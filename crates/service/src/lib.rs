@@ -16,7 +16,7 @@
 //! it belongs in `provider.rs`, where every translation that could differ for
 //! your vendor has its own named seam:
 //! - `chat_url` / `models_url` — endpoint construction
-//! - `decorate` — auth + required headers
+//! - `identity_headers` / `authenticate` — the identity every request carries
 //! - `to_upstream_body` — IR -> vendor request (per-model renames like
 //!   `max_tokens` vs `max_completion_tokens` go HERE, in code)
 //! - `decode_upstream_sse` — vendor SSE -> IR chunks
@@ -72,6 +72,31 @@ pub struct ServiceConfig {
     /// `opencode2api_kit::provider::DEFAULT_MAX_RESPONSE_BYTES`.
     #[serde(default)]
     pub max_response_bytes: Option<u64>,
+    /// The model-catalogue endpoint, when it is NOT `{base_url}/models`.
+    ///
+    /// Measured 2026-10-25 against the live vendor: the catalogue advertises
+    /// `/inference/openai/v1`, and chat works on BOTH that root and the legacy
+    /// `/inference/v1`, but `GET /inference/openai/v1/models` answers 404
+    /// while `GET /inference/v1/models` answers the list. A proxy that derives
+    /// its catalogue URL from the chat base therefore never passes readiness
+    /// on this deployment. An explicit value wins; otherwise the provider
+    /// applies the vendor's own sibling rule (see `OpenAiProvider::new`).
+    #[serde(default)]
+    pub models_url: Option<String>,
+    /// Ceiling on requests this sandbox keeps in flight to the vendor.
+    ///
+    /// A RESOURCE ceiling, like `max_response_bytes`, not a behavioural knob:
+    /// upstream is reported to apply a per-sandbox concurrency cliff (one
+    /// sibling proxy measured ~8 simultaneous requests turning into blanket
+    /// `403 FreeTierError`, with 400 ms spacing passing), and the ceiling is
+    /// what keeps the proxy under it. **The cliff is UNMEASURED on this
+    /// deployment** — `None` means no cap, which is the honest default until
+    /// someone runs the K ∈ {1, 4, 8, 12, 16} ladder against the genuine
+    /// client and sets this to that largest all-ok K minus one. Once set,
+    /// excess requests queue inside the vendor leg (latency grows, no 403);
+    /// they are not shed.
+    #[serde(default)]
+    pub max_inflight: Option<u32>,
 }
 
 fn default_provider_name() -> String {
@@ -91,6 +116,9 @@ impl ServiceConfig {
         }
         if let Ok(v) = std::env::var(opencode2api_kit::config::ENV_UPSTREAM_KEY) {
             cfg.api_key = Some(v);
+        }
+        if let Ok(v) = std::env::var(opencode2api_kit::config::ENV_UPSTREAM_MODELS_URL) {
+            cfg.models_url = Some(v);
         }
         if let Ok(v) = std::env::var(opencode2api_kit::config::ENV_UPSTREAM_KEYS) {
             cfg.api_keys.extend(

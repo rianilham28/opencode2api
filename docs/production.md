@@ -48,10 +48,20 @@ install -d -m 0750 -o opencode2api -g opencode2api /etc/opencode2api /var/lib/op
 
 # 2. build and install the binary; install the two shipped config
 #    templates. Configs are 0640 because the proxy config holds client_api_key.
+#    FIRST, once per checkout: the vendor leg links BoringSSL at the commit Bun
+#    pins, and the source is a gitignored checkout named by .cargo/config.toml.
+#    Build needs cmake and a C++ toolchain (clang/gcc) in addition to rustc.
+./scripts/fetch-boringssl.sh
 cargo build --release -p service
 install -m 0755 target/release/opencode2api /usr/local/bin/
 install -m 0640 config.production.example.json /etc/opencode2api/config.json
 install -m 0600 .env.example /etc/opencode2api/.env
+
+#    On a constrained sandbox (measured on daytona-small: no rustc/cargo/cmake/
+#    clang/go and ~755 MB RAM) build the binary on a full box and ship it as an
+#    artifact — an in-sandbox build is not viable. zstd/gzip exist there for
+#    transfer; the gateway has no file-upload route and caps exec args at
+#    ~128 KB, so provisioning must arrive as one artifact, not many small args.
 
 # 3. EDIT before starting: client_api_key in config.json; OPENCODE2API_UPSTREAM_URL
 #    AND OPENCODE2API_UPSTREAM_KEY in .env. The env URL overrides provider.base_url,
@@ -141,6 +151,21 @@ rate limiting.** What actually protects the box:
   limiting per-client is not wired for this shape and adding it is a separate
   design, not a checkbox here. The production example deliberately pins **8**
   permits below the library/example default of 256 to fit its 2 GiB cgroup.
+- `provider.models_url` exists because the vendor's catalogue and its chat
+  root are NOT the same path (measured 2026-10-25): completions answer on both
+  `/inference/openai/v1` and `/inference/v1`, but `GET …/openai/v1/models`
+  answers 404 while `GET /inference/v1/models` answers the list. The provider
+  therefore defaults the catalogue to the legacy sibling root and accepts an
+  explicit `provider.models_url` (or `OPENCODE2API_UPSTREAM_MODELS_URL`); the
+  split is intentional, and a readiness ladder probes whatever the provider
+  resolves. A fork on another vendor keeps the ordinary `{base_url}/models`.
+- `provider.max_inflight` is a DIFFERENT ceiling from `server.max_inflight`:
+  it caps requests this sandbox keeps in flight to the vendor, and it queues
+  rather than sheds. It exists because upstream is reported to apply a
+  per-sandbox concurrency cliff, and **that cliff is unmeasured here** — the
+  default `null` means no cap, which is the honest value until someone runs
+  the K ∈ {1, 4, 8, 12, 16} ladder with the genuine client on one IP and sets
+  this to the largest all-ok K minus one.
 - `max_body_bytes` is the request-body ceiling enforced by the router.
   `max_response_bytes` bounds buffered provider replies. The shipped values are
   16 MiB and 64 MiB. The production sizing allowance is 160 MiB/permit
