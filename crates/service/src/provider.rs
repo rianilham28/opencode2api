@@ -357,12 +357,20 @@ fn env_block() -> String {
 }
 
 /// The one tool the gate inspects: an array entry whose name is exactly
-/// `read`. Measured 2026-10-25: parameters, description and the wrapper are
-/// UNCONSTRAINED (a bare `{"name":"read"}` passes), while `READ` or a renamed
-/// `Read` fails — so this is the entire fingerprint, appended only when the
-/// caller did not send it.
+/// `read`. `READ` or a renamed `Read` fails, so this is the entire identity,
+/// appended only when the caller did not send a tool with that exact name.
+///
+/// The shape is the full OpenAI function wrapper, not the bare
+/// `{"name":"read"}` the gate also accepts: measured 2026-10-25, some upstream
+/// models validate the tool schema strictly and answer
+/// `400 missing_required_param tools[0].type` for the bare form (`beam-free`),
+/// while the wrapper passes on every model tested (`deepseek-v4.1-flash-free`,
+/// `beam-free`). Gate acceptance and model acceptance are different bars.
 fn gate_read_tool() -> Value {
-    json!({ "name": "read" })
+    json!({
+        "type": "function",
+        "function": { "name": "read", "parameters": {} }
+    })
 }
 
 /// Whether `content` already carries the pair the vendor reads, so a caller's
@@ -3383,7 +3391,7 @@ mod tests {
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert_eq!(
             body["tools"],
-            json!([{ "name": "read" }]),
+            json!([gate_read_tool()]),
             "zero caller tools still needs the bare read entry the gate looks for"
         );
         assert!(
@@ -3421,7 +3429,7 @@ mod tests {
         let body = provider("https://x.test/v1").to_upstream_body(&req);
         assert_eq!(
             body["tools"],
-            json!([weather, { "name": "read" }]),
+            json!([weather, gate_read_tool()]),
             "the caller's tool is untouched and read is appended"
         );
         assert!(
@@ -3443,7 +3451,7 @@ mod tests {
         let tools = json!([
             {"name": "bash", "parameters": {"type": "object"}},
             {"name": "str_replace_editor"},
-            {"name": "read", "parameters": {}}
+            gate_read_tool()
         ]);
         let req: ChatRequest = serde_json::from_value(json!({
             "model": "m",
@@ -3728,7 +3736,7 @@ mod tests {
     fn tool_choice_none_is_stripped_and_the_callers_tools_stay() {
         let client_tools = json!([
             {"name": "bash", "parameters": {"type": "object"}},
-            {"name": "read", "parameters": {}}
+            gate_read_tool()
         ]);
         let req: ChatRequest = serde_json::from_value(json!({
             "model": "m",
@@ -3809,7 +3817,7 @@ mod tests {
         let tools = body["tools"].as_array().expect("flat tools");
         assert_eq!(
             tools,
-            &vec![json!({ "name": "read" })],
+            &vec![super::gate_read_tool()],
             "the gate's bare read"
         );
         assert!(
@@ -3845,7 +3853,7 @@ mod tests {
         let tools = body["tools"].as_array().expect("chat tools");
         assert_eq!(
             tools,
-            &vec![json!({ "name": "read" })],
+            &vec![super::gate_read_tool()],
             "the gate's bare read"
         );
         assert_eq!(body["temperature"], 0.7, "chat extras pass through");
