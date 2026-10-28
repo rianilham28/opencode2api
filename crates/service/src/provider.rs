@@ -366,10 +366,15 @@ fn env_block() -> String {
 /// `400 missing_required_param tools[0].type` for the bare form (`beam-free`),
 /// while the wrapper passes on every model tested (`deepseek-v4.1-flash-free`,
 /// `beam-free`). Gate acceptance and model acceptance are different bars.
+///
+/// `parameters` is a real object schema, not `{}`: strict upstream routes
+/// answer `400 Invalid schema for function 'read': schema must be a JSON
+/// Schema of 'type: "object"'` for the empty schema, which fails the ladder
+/// and withholds every sandbox that lands on such a route.
 fn gate_read_tool() -> Value {
     json!({
         "type": "function",
-        "function": { "name": "read", "parameters": {} }
+        "function": { "name": "read", "parameters": { "type": "object", "properties": {} } }
     })
 }
 
@@ -3408,6 +3413,21 @@ mod tests {
                 .as_str()
                 .is_some_and(|note| note.contains("gateway placeholder")),
             "a caller with no file-read tool is told the read entry is a placeholder"
+        );
+    }
+
+    /// Strict upstream routes 400 a tool whose schema is not an object schema,
+    /// so the placeholder must declare one — and no path property, so it never
+    /// reads as a caller file-read tool that calls could be translated into.
+    #[test]
+    fn gate_read_declares_an_object_schema() {
+        let tool = gate_read_tool();
+        let parameters = &tool["function"]["parameters"];
+        assert_eq!(parameters["type"], "object", "strict routes reject `{{}}`");
+        assert!(parameters["properties"].is_object());
+        assert!(
+            super::read_target(&tool).is_none(),
+            "the placeholder is not a translatable read tool"
         );
     }
 
