@@ -543,13 +543,18 @@ async fn chat_mode_reaches_every_upstream_surface_and_adds_no_request_id() {
         // The vendor leg writes the client's own default block: `*/*` on
         // every request, no per-mode Accept choice.
         assert_eq!(header_value(head, "accept"), Some("*/*"));
-        for absent in ["x-request-id", "b3", "traceparent"] {
-            assert_eq!(
-                header_value_count(head, absent),
-                0,
-                "{absent} is not part of the genuine request shape"
-            );
-        }
+        // The caller's correlation id is never relayed — but the genuine
+        // client's tracing pair rides every model call.
+        assert_eq!(
+            header_value_count(head, "x-request-id"),
+            0,
+            "the caller's request id stays in this process's logs"
+        );
+        assert!(
+            header_value(head, "traceparent").is_some(),
+            "every call carries the genuine tracing pair"
+        );
+        assert!(header_value(head, "b3").is_some());
     }
     // The vendor gate 403s a buffered upstream request, so even the buffered
     // client's turn is forwarded with stream forced on.
@@ -599,7 +604,7 @@ async fn models_without_configured_credentials_send_no_correlation_header() {
     assert_eq!(header_value_count(&heads[0], "x-request-id"), 0);
     assert_eq!(
         header_value(&heads[0], "user-agent"),
-        Some("opencode/latest/2.1.4/cli")
+        Some("opencode/latest/2.2.2/cli")
     );
 }
 
@@ -2732,9 +2737,25 @@ async fn systemone_relays_the_decision_body_with_the_opencode_identity() {
     assert_eq!(request_target(head), "/v1/systemone");
     assert_eq!(
         header_value(head, "user-agent"),
-        Some("opencode/latest/2.1.4/cli"),
+        Some("opencode/latest/2.2.2/cli"),
         "the gate pairs this agent string with the tools fingerprint"
     );
+    // The tracing pair the genuine 2.2.2 client sends: one trace per
+    // process, one span per request, spelled by both headers.
+    let traceparent = header_value(head, "traceparent").expect("traceparent header");
+    let b3 = header_value(head, "b3").expect("b3 header");
+    let tp: Vec<&str> = traceparent.split('-').collect();
+    assert_eq!(tp.len(), 4, "{traceparent}");
+    assert_eq!(tp[0], "00", "{traceparent}");
+    assert_eq!(tp[1].len(), 32, "{traceparent}");
+    assert_eq!(tp[2].len(), 16, "{traceparent}");
+    assert_eq!(tp[3], "01", "sampled, as the genuine client marks it");
+    let bp: Vec<&str> = b3.split('-').collect();
+    assert_eq!(bp.len(), 4, "{b3}");
+    assert_eq!(bp[0], tp[1], "one trace shared by both spellings");
+    assert_eq!(bp[1], tp[2], "the same span in both spellings");
+    assert_eq!(bp[2], "1");
+    assert_eq!(bp[3].len(), 16, "{b3}");
     assert_eq!(header_value(head, "x-opencode-client"), Some("cli"));
     let project = header_value(head, "x-opencode-project").expect("project header");
     assert_eq!(project.len(), 40, "{project}");

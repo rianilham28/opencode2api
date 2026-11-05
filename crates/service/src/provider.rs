@@ -317,10 +317,10 @@ fn touch_when_stream_ends(
 /// free-tier gate 403s unless its headers are present with this exact shape.
 /// Every value here is built ONCE at `new()` — request time only clones
 /// `HeaderValue`s (a refcount bump, no parse, no validation). The minted
-/// pair rolls ONCE per provider so a served process reads as one long-lived
-/// client session instead of a new one per call. The user-agent is NOT
-/// minted here — it is read live at request time, because it follows the
-/// published release.
+/// session rolls ONCE per provider so a served process reads as one
+/// long-lived client session instead of a new one per call, and the trace id
+/// likewise: the genuine client keeps one trace for the process and mints a
+/// span per request (captured 2026-11-05).
 struct OpenCodeProfile {
     client: http::HeaderValue,
     project: http::HeaderValue,
@@ -330,15 +330,22 @@ struct OpenCodeProfile {
     /// the session under a lock.
     affinity: http::HeaderValue,
     session_id: http::HeaderValue,
+    /// 32 lowercase hex: the trace half both tracing headers carry.
+    trace_id: String,
 }
 
-/// The agent string a genuine 2.1.4 client presents. Measured 2026-10-25:
-/// the vendored gate reads the SHAPE — three slash-separated segments starting
-/// `opencode/` (`opencode/9.9.9/cli` passes; `opencode`, `curl/8` and absent
-/// fail) — so this follows the captured client. The load-bearing parts of the
-/// body are a tool named exactly `read` ([`gate_read_tool`]), `stream: true`,
-/// and the `<env>` block in a system message ([`env_block`]).
-const OPENCODE_UA: &str = "opencode/latest/2.1.4/cli";
+/// The agent string the captured client presents. Measured 2026-10-25: the
+/// gate reads the SHAPE — slash-separated segments starting `opencode/`
+/// (`opencode/9.9.9/cli` passes; `opencode`, `curl/8` and absent fail) — and
+/// `opencode/latest/2.2.2/cli` is what a genuine 2.2.2 client put on the wire
+/// (captured 2026-11-05, Bun 1.4.4). The load-bearing parts of the body are a
+/// tool named exactly `read` ([`gate_read_tool`]), `stream: true`, and the
+/// `<env>` block in a system message ([`env_block`]).
+///
+/// A constant, deliberately: it is one half of the UA/tools pair, and
+/// adopting a published version without its matching tools fingerprint would
+/// 403 every request in flight. Bump it together with a fresh capture.
+const OPENCODE_UA: &str = "opencode/latest/2.2.2/cli";
 
 /// The working directory the synthesized `<env>` block names. The vendor does
 /// not read the VALUE (measured 2026-10-25: `/`, `/tmp`, `/root`, an empty
@@ -462,6 +469,21 @@ fn mint_opencode_project() -> http::HeaderValue {
         id.push_str(&format!("{:010x}", seed & 0xF_FFFF_FFFF));
     }
     http::HeaderValue::from_str(&id).expect("hex is header-legal")
+}
+
+/// The process's trace id: 16 random bytes as 32 lowercase hex, which is the
+/// trace half of both `b3` and `traceparent`. Minted once per provider, like
+/// the session — the genuine client keeps one trace for the process and mints
+/// a fresh span per request (captured 2026-11-05: two requests, one trace,
+/// two spans).
+fn mint_trace_id() -> String {
+    let mut seed = next_ordered() ^ u64::from(std::process::id());
+    let mut id = String::with_capacity(32);
+    for _ in 0..2 {
+        seed = splitmix64(seed);
+        id.push_str(&format!("{seed:016x}"));
+    }
+    id
 }
 
 pub struct OpenAiProvider {
@@ -599,7 +621,7 @@ impl OpenAiProvider {
         // caller credentials are not accepted on this proxy-owned catalogue,
         // and a deployment with NO credential still fetches it unauthenticated
         // (the free catalogue is public).
-        let mut headers = self.identity_headers();
+        let mut headers = self.identity_headers(ctx);
         let slot = if self.pool.is_empty() {
             None
         } else {
@@ -667,6 +689,7 @@ impl OpenAiProvider {
             affinity: session.clone(),
             session_id: session.clone(),
             session,
+            trace_id: mint_trace_id(),
         };
         // UA and tools move as ONE pair — see the gate comment on
         // [OPENCODE_UA] — so there is no release chase here: adoption of a
@@ -888,7 +911,7 @@ impl OpenAiProvider {
     /// one, and a per-call UUID in a request whose shape is load-bearing is
     /// noise the proxy does not need to add. The caller's request id survives
     /// in this process's logs and terminal record instead.
-    fn identity_headers(&self) -> Vec<(String, String)> {
+    fn identity_headers(&self, ctx: &CallContext<'_>) -> Vec<(String, String)> {
         // The whole identity rides every request: upstream's gate 403s unless
         // all of these are present, the minted pair is the SAME on every call
         // so this process reads as one long-lived opencode session.
@@ -899,8 +922,12 @@ impl OpenAiProvider {
                 .expect("minted identity headers are ASCII")
                 .to_string()
         };
-        vec![
-            ("User-Agent".to_string(), OPENCODE_UA.to_string()),
+        let mut headers = Vec::with_capacity(10);
+        headers.push(("User-Agent".to_string(), OPENCODE_UA.to_string()));
+        // The genuine client's tracing pair, in its byte-sorted place:
+        // after `User-Agent`, before `x-opencode-*`.
+        headers.extend(self.tracing_headers(ctx.request_id));
+        headers.extend([
             ("x-opencode-client".to_string(), header(&profile.client)),
             ("x-opencode-project".to_string(), header(&profile.project)),
             ("x-opencode-session".to_string(), header(&profile.session)),
@@ -913,6 +940,30 @@ impl OpenAiProvider {
             ),
             ("x-session-affinity".to_string(), header(&profile.affinity)),
             ("x-session-id".to_string(), header(&profile.session_id)),
+        ]);
+        headers
+    }
+
+    /// The two tracing headers the genuine client sends on every model call.
+    ///
+    /// `b3` is `{trace}-{span}-1-{parent}` (sampled) and `traceparent` is the
+    /// W3C spelling of the same trace and span. The span is minted per request
+    /// from the ordered clock XOR the request id, so two calls in one
+    /// millisecond still differ, and a span in the vendor's own trace can be
+    /// matched back to this process's log line.
+    fn tracing_headers(&self, request_id: u64) -> [(String, String); 2] {
+        let span = splitmix64(next_ordered() ^ request_id);
+        let parent = splitmix64(span);
+        let trace = self.opencode.trace_id.as_str();
+        [
+            (
+                "traceparent".to_string(),
+                format!("00-{trace}-{span:016x}-01"),
+            ),
+            (
+                "b3".to_string(),
+                format!("{trace}-{span:016x}-1-{parent:016x}"),
+            ),
         ]
     }
 
@@ -1116,7 +1167,7 @@ impl OpenAiProvider {
             completed: false,
             transport_error: false,
         };
-        let mut headers = self.identity_headers();
+        let mut headers = self.identity_headers(ctx);
         headers.push(("Content-Type".to_string(), "application/json".to_string()));
         let slot = self
             .authenticate(&mut headers, ctx.client_authorization())
@@ -1973,10 +2024,10 @@ impl Provider for OpenAiProvider {
     async fn relay_protocol(
         &self,
         body: bytes::Bytes,
-        _ctx: &CallContext<'_>,
+        ctx: &CallContext<'_>,
     ) -> Result<RawReply, ProviderError> {
         let lane = self.transport.lane()?;
-        let mut headers = self.identity_headers();
+        let mut headers = self.identity_headers(ctx);
         headers.push(("Content-Type".to_string(), "application/json".to_string()));
         self.authenticate(&mut headers, None)?;
         let req = opencode2api_transport::vendor::VendorRequest::post(
@@ -3130,7 +3181,7 @@ mod tests {
         }))
         .unwrap();
         let body = p.to_upstream_body(&req);
-        let mut headers = p.identity_headers();
+        let mut headers = p.identity_headers(&CallContext::new(1, None));
         headers.push(("Content-Type".into(), "application/json".into()));
         p.authenticate(&mut headers, None)
             .expect("public credential");
@@ -3292,7 +3343,7 @@ mod tests {
     /// The headers `send()` writes, in the order it hands them to the vendor
     /// leg (the leg sorts them byte-wise on the wire).
     fn decorated(profile: &OpenAiProvider) -> Vec<(String, String)> {
-        let mut headers = profile.identity_headers();
+        let mut headers = profile.identity_headers(&CallContext::new(7, None));
         profile
             .authenticate(&mut headers, None)
             .expect("a configured credential authenticates");
@@ -3357,9 +3408,32 @@ mod tests {
         );
         assert_eq!(header(h, "x-session-id"), header(h, "x-opencode-session"));
         assert_eq!(header(h, "Authorization"), Some("Bearer public"));
-        // The genuine client sends no correlation id, and a per-call UUID in
-        // a shape-checked request is noise this proxy must not add.
-        for absent in ["x-request-id", "x-opencode-request", "traceparent", "b3"] {
+        // The genuine 2.2.2 client sends the tracing pair on every model
+        // call (captured 2026-11-05): `traceparent` is W3C, `b3` is its
+        // sampling-aware spelling of the SAME trace and span.
+        let traceparent = header(h, "traceparent").expect("traceparent");
+        let b3 = header(h, "b3").expect("b3");
+        let tp: Vec<&str> = traceparent.split('-').collect();
+        assert_eq!(tp.len(), 4, "{traceparent}");
+        assert_eq!(tp[0], "00", "{traceparent}");
+        assert_eq!(tp[1].len(), 32, "{traceparent}");
+        assert_eq!(tp[2].len(), 16, "{traceparent}");
+        assert_eq!(tp[3], "01", "sampled, as the genuine client sends");
+        assert!(
+            tp[1]
+                .bytes()
+                .chain(tp[2].bytes())
+                .all(|b| b.is_ascii_hexdigit()),
+            "{traceparent}"
+        );
+        let bp: Vec<&str> = b3.split('-').collect();
+        assert_eq!(bp.len(), 4, "{b3}");
+        assert_eq!(bp[0], tp[1], "one trace id per process, shared by both");
+        assert_eq!(bp[1], tp[2], "the same span in both spellings");
+        assert_eq!(bp[2], "1", "sampled");
+        assert_eq!(bp[3].len(), 16, "{b3}");
+        // Still absent: the genuine client sends neither.
+        for absent in ["x-request-id", "x-opencode-request"] {
             assert!(
                 header(h, absent).is_none(),
                 "{absent} is not part of the 2.x profile"
