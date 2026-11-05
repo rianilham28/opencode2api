@@ -759,6 +759,29 @@ fn take_verbatim_batch(frame: &mut BytesMut, safe_len: &mut usize) -> Option<Byt
 /// `Bytes` (amortized allocation), and nothing is ever held back waiting for
 /// a later read — a relayed stream must reach the client at upstream's pace,
 /// not upstream's total length.
+/// How long the relay keeps reading a finished vendor stream so its socket
+/// can reach a clean HTTP boundary. The bytes after `[DONE]` are the vendor's
+/// own bookkeeping; a peer that never closes must not hold the client's body
+/// open, so this is a ceiling, not a wait.
+const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Poll the vendor stream to EOF (bounded) without forwarding anything.
+async fn drain_upstream(upstream: &mut ChunkStream, budget: std::time::Duration) {
+    let deadline = tokio::time::sleep(budget);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            item = AssertUnwindSafe(upstream.next()).catch_unwind() => {
+                match item {
+                    Ok(Some(Ok(_))) => continue,
+                    _ => break,
+                }
+            }
+        }
+    }
+}
+
 fn verbatim_body(
     upstream: ChunkStream,
     cfg: Arc<ServerConfig>,
@@ -850,6 +873,15 @@ fn verbatim_body(
                                 yield Ok::<Bytes, std::io::Error>(b);
                             }
                             if sentinel {
+                                // The relay is done forwarding at `[DONE]`,
+                                // but the vendor is not: its bookkeeping frame
+                                // and the HTTP chunked terminal follow. A
+                                // socket read to that terminal is parked on the
+                                // lane and reused; one dropped here costs the
+                                // next call a fresh CONNECT + TLS (measured:
+                                // `vendor_connections_total{kind="reused"}`
+                                // never moved). Bounded, best-effort.
+                                drain_upstream(&mut upstream, DRAIN_BUDGET).await;
                                 return;
                             }
                         }
@@ -1417,6 +1449,58 @@ mod tests {
         });
         assert_eq!(lines[0]["fields"]["result"], "truncated");
         assert_eq!(lines[0]["fields"]["status"], 200);
+    }
+
+    /// The relay stops FORWARDING at `[DONE]`, but it must keep READING: the
+    /// vendor's bookkeeping frame and the chunked terminal are what let the
+    /// lane park the socket. Dropping at `[DONE]` is why every streamed call
+    /// paid a fresh CONNECT + TLS (`vendor_connections_total{kind="reused"}`
+    /// never moved).
+    #[test]
+    fn the_verbatim_lane_reads_past_done_so_the_lane_can_pool() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let seen = polls.clone();
+        let frames = vec![
+            Ok::<_, String>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+            Ok(Bytes::from_static(b"data: {\"cost\":0}\n\n")),
+        ];
+        let upstream = futures_util::stream::iter(frames)
+            .inspect(move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            })
+            .boxed();
+        let response = stream_response(
+            Source::Verbatim(upstream),
+            None,
+            InboundFormat::OpenAi,
+            Arc::new(ServerConfig::default()),
+            None,
+            "chat",
+            test_origin(),
+        );
+        let bytes = response_bytes(&rt, response);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.ends_with("[DONE]\n\n"),
+            "the client's body still ends at its terminator: {text}"
+        );
+        assert!(
+            !text.contains("cost"),
+            "the post-DONE frame is read, never forwarded: {text}"
+        );
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            3,
+            "the frame after [DONE] must be polled so the socket reaches its terminal"
+        );
     }
 
     #[test]
