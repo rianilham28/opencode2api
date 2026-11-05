@@ -1182,9 +1182,28 @@ impl OpenAiProvider {
         ctx: &CallContext<'_>,
     ) -> Result<(UpstreamResponse, TouchOnDrop), ProviderError> {
         let mut pauses = VENDOR_RETRY_PAUSES.iter();
+        let mut replaced_exit = false;
         loop {
             match self.send_once(url.clone(), &body, ctx).await {
                 Ok(sent) => return Ok(sent),
+                // The exit cannot serve (its quota is spent, or its country is
+                // refused) and the lane was just pulled. One more attempt is
+                // worth it: it lands on the replacement the pool is already
+                // minting, and the client never sees a verdict that this
+                // deployment has the means to route around. Bounded to one, so
+                // a poisoned pool cannot double the traffic.
+                Err((error, true))
+                    if !replaced_exit
+                        && self.transport.has_replaceable_lanes()
+                        && (quota_exhausted(&error) || region_blocked(&error)) =>
+                {
+                    replaced_exit = true;
+                    tracing::warn!(
+                        request_id = ctx.request_id,
+                        status = error.status,
+                        "exit ip cannot serve; retrying once on a replacement lane"
+                    );
+                }
                 Err((error, true)) if transient_vendor_error(&error) => match pauses.next() {
                     Some(pause) => {
                         tracing::warn!(
