@@ -734,7 +734,16 @@ impl Reader {
         loop {
             if let Some(at) = find_head_end(&self.buf) {
                 let head = self.buf.split_to(at + 4);
-                return wire::Head::parse(&head[..at]);
+                let parsed = wire::Head::parse(&head[..at])?;
+                // A 1xx is not the answer. RFC 9110 allows any number of
+                // interim heads before the final one, and an edge that sends
+                // `103 Early Hints` must not be read as a final 103 response
+                // — the stream would be handed to the caller with no body.
+                // 1xx carries no body, so the next head starts immediately.
+                if parsed.status.is_informational() {
+                    continue;
+                }
+                return Ok(parsed);
             }
             if self.buf.len() > 64 * 1024 {
                 return Err(io::Error::other("response head exceeds 64 KiB"));
@@ -1437,6 +1446,38 @@ mod tests {
             1,
             "plain chunked must return its connection to the lane"
         );
+    }
+
+    /// A 1xx interim head is not the answer: the caller must see the FINAL
+    /// head. Reading `103 Early Hints` as a final 103 would hand back an
+    /// empty body and leave the real response bytes on a socket the pool
+    /// could then reuse.
+    #[tokio::test]
+    async fn interim_1xx_heads_are_skipped() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = read_head(&mut sock).await;
+            sock.write_all(
+                b"HTTP/1.1 103 Early Hints\r\nlink: </x.css>; rel=preload\r\n\r\n\
+                  HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
+            )
+            .await
+            .unwrap();
+        });
+        let server_cfg = ServerConfig::default();
+        let vendor = test_vendor(&server_cfg);
+        let lane = test_lane();
+        let url = reqwest::Url::parse(&format!("http://{addr}/v1/models")).unwrap();
+        let resp = vendor
+            .send(&lane, VendorRequest::get(url, vec![]))
+            .await
+            .expect("the mock answered");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(resp.body_bytes().await.unwrap().as_ref(), b"ok");
+        server.await.unwrap();
     }
 
     /// A body with neither a length nor chunking ends at EOF and must NOT be
