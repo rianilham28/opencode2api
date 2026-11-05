@@ -134,6 +134,10 @@ pub mod names {
     /// Freshly minted sessions discarded because their probed exit IP was
     /// already known spent (`proxy.ip_probe_url` only).
     pub const IP_REJECTED: &str = "opencode2api_proxy_lane_ip_rejected_total";
+    /// Payload bytes the vendor leg sent and received, by vendor and direction
+    /// (`sent|received`). Body bytes only: the heads are a constant per
+    /// request and would swamp nothing.
+    pub const VENDOR_BYTES: &str = "opencode2api_vendor_bytes_total";
 }
 
 /// Describe the egress metric family at recorder installation.
@@ -181,6 +185,10 @@ pub fn describe_metrics() {
     metrics::describe_counter!(
         names::IP_REJECTED,
         "Fresh sessions discarded for landing on a known-spent exit IP, by vendor"
+    );
+    metrics::describe_counter!(
+        names::VENDOR_BYTES,
+        "Vendor-leg payload bytes by vendor and direction (sent|received)"
     );
 }
 

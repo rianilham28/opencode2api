@@ -434,8 +434,10 @@ truth for which; README "Quick start" lists the common ones.
   sigalgs, groups, ALPN, versions) and both gates build their context from
   `client_connector()`, the dialer's own constructor, so a gate can never
   certify a configuration the dialer does not use.
-  Encoded response bodies are decoded but never pooled (a codec ends before
-  the HTTP framing terminal); identity bodies are. `provider.max_inflight` is
+  Encoded RESPONSE bodies are decoded but never pooled (a codec ends before
+  the HTTP framing terminal); identity bodies are. Request bodies are never
+  compressed: the edge rejects `Content-Encoding: gzip` on them (measured 400,
+  2026-11-06), so the leg sends them as-is. `provider.max_inflight` is
   the UNMEASURED concurrency ceiling — it queues, never sheds. The BODY is a
   credential too: `chat_body` SYNTHESIZES a literal `<env>`/`</env>` pair
   containing `Working directory:` into a SYSTEM message (any existing valid

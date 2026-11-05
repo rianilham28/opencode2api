@@ -291,6 +291,10 @@ Metrics worth alerting on:
   body that dies mid-flight) can retire an exit IP. A spike here is a slow
   upstream, not a dead proxy — retiring lanes on it is how three slow
   generations used to cost three healthy sessions.
+- `opencode2api_vendor_bytes_total{vendor,direction}` (`sent|received`) — the
+  vendor leg's payload bytes. The egress is often billed by data, so this is the
+  counter that prices a policy: retries, re-uploads and probes are only visible
+  here.
 - `opencode2api_proxy_lane_quota_spent_total{vendor}` and
   `opencode2api_proxy_lane_ip_rejected_total{vendor}` — lanes pulled because
   their exit IP spent the vendor's free quota, and fresh sessions discarded
@@ -552,6 +556,10 @@ What each part is defending:
   before it serves. It costs one small request per session — enable it on a
   metered vendor only while debugging; the quota 429 itself costs nothing to
   act on.
+- **Request bodies are NOT compressed.** `Content-Encoding: gzip` on the
+  outbound chat body is rejected by the edge (`400`, empty body — measured on a
+  valid gzip payload, 2026-11-06), so the leg sends bodies as-is and the only
+  compression is on the one-shot catalogue GET.
 - **A free-quota 429 pulls its lane.** When the vendor's envelope says
   `FreeUsageLimitError`, the provider reports the lane as spent and the pool
   replaces the session at its next tick instead of waiting for the TTL. The

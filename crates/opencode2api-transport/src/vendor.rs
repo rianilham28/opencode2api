@@ -501,6 +501,10 @@ impl VendorClient {
                     "vendor request write failed: {e}"
                 )));
             }
+            // What this attempt cost this deployment in egress bytes. The
+            // provider's retry policy and the client's are costed against it;
+            // without the counter neither can be priced.
+            note_wire_bytes(lane, "sent", head.len() + req.body.len());
             let mut reader = Reader {
                 conn,
                 buf: BytesMut::with_capacity(16 * 1024),
@@ -920,6 +924,16 @@ fn build_head(
     Ok(Bytes::from(out))
 }
 
+/// Count one direction of vendor-leg payload bytes.
+fn note_wire_bytes(lane: &Arc<Lane>, direction: &'static str, bytes: usize) {
+    metrics::counter!(
+        crate::names::VENDOR_BYTES,
+        "vendor" => lane.vendor(),
+        "direction" => direction,
+    )
+    .increment(bytes as u64);
+}
+
 /// Where a finished body's connection goes back to.
 struct PoolReturn {
     lane: Arc<Lane>,
@@ -1137,7 +1151,9 @@ mod wire {
                         }
                         let take = (reader.buf.len() as u64).min(remaining) as usize;
                         remaining -= take as u64;
-                        yield reader.buf.split_to(take).freeze();
+                        let chunk = reader.buf.split_to(take).freeze();
+                        note_wire_bytes(&lane, "received", chunk.len());
+                        yield chunk;
                     }
                     done = true;
                 }
@@ -1167,7 +1183,9 @@ mod wire {
                         }
                         let take = (reader.buf.len() as u64).min(remaining) as usize;
                         remaining -= take as u64;
-                        yield reader.buf.split_to(take).freeze();
+                        let chunk = reader.buf.split_to(take).freeze();
+                        note_wire_bytes(&lane, "received", chunk.len());
+                        yield chunk;
                     }
                     let crlf = reader.read_line(read_timeout).await?;
                     if !crlf.is_empty() {
@@ -1180,7 +1198,9 @@ mod wire {
                 }
                 Framing::Close => loop {
                     if !reader.buf.is_empty() {
-                        yield reader.buf.split().freeze();
+                        let chunk = reader.buf.split().freeze();
+                        note_wire_bytes(&lane, "received", chunk.len());
+                        yield chunk;
                     }
                     if reader.fill(read_timeout).await? == 0 {
                         break;
@@ -1737,6 +1757,72 @@ mod tests {
         assert_eq!(resp.status(), http::StatusCode::OK);
         assert_eq!(resp.body_bytes().await.unwrap().as_ref(), b"ok");
         server.await.unwrap();
+    }
+
+    /// Payload bytes are counted in both directions: the egress is billed by
+    /// data and nothing else in the process measures it, so a cut cannot be
+    /// priced (or proven) without this pair.
+    #[test]
+    fn wire_bytes_are_counted_in_both_directions() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                use tokio::io::AsyncWriteExt;
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    let _ = read_head(&mut sock).await;
+                    sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                        .await
+                        .unwrap();
+                });
+                let server_cfg = ServerConfig::default();
+                let vendor = test_vendor(&server_cfg);
+                let lane = test_lane();
+                let url = reqwest::Url::parse(&format!("http://{addr}/v1/models")).unwrap();
+                let resp = vendor
+                    .send(
+                        &lane,
+                        VendorRequest::post(url, vec![], Bytes::from_static(b"{}")),
+                    )
+                    .await
+                    .expect("the mock answered");
+                assert_eq!(resp.body_bytes().await.unwrap().as_ref(), b"ok");
+                server.await.unwrap();
+            });
+        });
+        let mut sent = 0u64;
+        let mut received = 0u64;
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            if key.key().name() != crate::names::VENDOR_BYTES {
+                continue;
+            }
+            let DebugValue::Counter(count) = value else {
+                continue;
+            };
+            match key
+                .key()
+                .labels()
+                .find(|l| l.key() == "direction")
+                .map(|l| l.value())
+            {
+                Some("sent") => sent += count,
+                Some("received") => received += count,
+                _ => {}
+            }
+        }
+        assert_eq!(received, 2, "the reply body is counted");
+        assert!(
+            sent > 2,
+            "the request body (and its head) are counted: {sent}"
+        );
     }
 
     /// A body with neither a length nor chunking ends at EOF and must NOT be
