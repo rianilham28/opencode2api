@@ -7,29 +7,37 @@
 //! preserves header case nor emits the client's header order.
 //!
 //! What is copied, and what must stay copied:
-//! - the TLS library is BoringSSL at the commit Bun pins, with STOCK defaults
-//!   (cipher order, groups including the ML-KEM hybrid, signature algorithms,
-//!   extension order). Nothing here sets a cipher list, a curve list, or a
-//!   sigalg list: every one of those is a fingerprint, and "improving" one
-//!   moves the hello away from the genuine client. GREASE stays at BoringSSL's
-//!   default (off) for the same reason.
+//! - the TLS library is BoringSSL at the commit Bun pins, with the genuine
+//!   client's settings: cipher order, groups including the ML-KEM hybrid,
+//!   extension order, and Bun's own verification-signature-algorithm list
+//!   ([`BUN_SIGALGS`] — BoringSSL's STOCK default is not what Bun sends, and
+//!   the difference lives in extension 13's body, which JA3 cannot see).
+//!   Nothing here sets a cipher list or a curve list, and GREASE stays at
+//!   BoringSSL's default (off): every one of those moves the hello away from
+//!   the genuine client, which is the invariant — not "stock defaults".
 //! - per-connection decoration is what Bun itself adds: SNI, ALPN `http/1.1`
 //!   only (no h2), OCSP stapling and SCT requests.
 //! - the request head is written here, not by hyper: the caller's headers are
 //!   emitted byte-sorted with their case preserved, then the client's default
 //!   block (`Connection`, `Accept`, `Host`, `Accept-Encoding`,
 //!   `Content-Length`). `b3`/`traceparent` are the genuine client's tracing
-//!   headers, not gate inputs, so they are not minted.
+//!   headers and the PROVIDER mints them; this writer only places them where
+//!   byte order puts them.
 //!
-//! What is NOT copied: TLS session resumption (the genuine client sends a PSK
-//! after its first verified handshake; this leg reuses keep-alive connections
-//! per lane but never resumes a session, so a NEW connection pays the full
-//! handshake), and the in-flight concurrency ceiling the vendor applies per
-//! sandbox, which is unmeasured — `provider.max_inflight` is the operator's
-//! ceiling, not a measurement of the vendor's.
+//! What is NOT copied: TLS session resumption, and that matches the genuine
+//! client rather than diverging from it — two consecutive Bun-fetch
+//! connections captured 2026-11-05 carried no `pre_shared_key` extension
+//! (usockets enables the client cache but leaves storage to a callback the
+//! fetch path never feeds). This leg never resumes, so a NEW connection pays
+//! the full handshake. Neither is the in-flight concurrency ceiling the
+//! vendor applies per sandbox, which is unmeasured — `provider.max_inflight`
+//! is the operator's ceiling, not a measurement of the vendor's.
 //!
-//! The JA3 test at the bottom is the gate: it captures the ClientHello this
-//! module emits and fails on any drift from the measured fingerprint.
+//! The tests at the bottom are the gate. JA3 covers the cipher list and the
+//! extension IDS; `client_hello_matches_the_genuine_clients_full_shape`
+//! covers what JA3 cannot see (extension order, body lengths, signature
+//! algorithms, groups, ALPN, supported versions) — the axis on which this
+//! module DID drift once.
 
 use std::io;
 use std::pin::Pin;
@@ -38,7 +46,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use async_compression::tokio::bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZstdDecoder};
-use boring::ssl::{SslConnector, SslMethod, SslVersion};
+use boring::ssl::{
+    SslConnector, SslConnectorBuilder, SslMethod, SslSignatureAlgorithm, SslVersion,
+};
 use boring::x509::{X509, store::X509StoreBuilder};
 use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -263,21 +273,66 @@ struct Inner {
     read_timeout: Duration,
 }
 
+/// Bun's verification-signature-algorithm list, verbatim from
+/// `packages/bun-usockets/src/crypto/openssl.c`
+/// (`us_ssl_ctx_set_verify_signature_algorithms`, bun-v1.4.4).
+///
+/// This is the ONE place the leg deliberately departs from a BoringSSL
+/// default, and the departure is toward the genuine client, not away from it:
+/// BoringSSL's `kVerifySignatureAlgorithms` has nine entries, while Bun sets
+/// this eleven-entry list (adding ED25519 and ECDSA-SECP521R1-SHA512 before
+/// the SHA-1 fallback). The difference lives in extension 13's BODY, which
+/// JA3 does not hash — so the JA3 gate stayed green while the emitted hello
+/// differed from opencode 2.2.2's (captured 2026-11-05). With this list the
+/// two hellos are byte-identical once the per-connection randomness
+/// (client_random, legacy session id, key-share key material) is set aside,
+/// which is what the full-shape test below pins.
+const BUN_SIGALGS: [SslSignatureAlgorithm; 11] = [
+    SslSignatureAlgorithm::ECDSA_SECP256R1_SHA256,
+    SslSignatureAlgorithm::RSA_PSS_RSAE_SHA256,
+    SslSignatureAlgorithm::RSA_PKCS1_SHA256,
+    SslSignatureAlgorithm::ECDSA_SECP384R1_SHA384,
+    SslSignatureAlgorithm::RSA_PSS_RSAE_SHA384,
+    SslSignatureAlgorithm::RSA_PKCS1_SHA384,
+    SslSignatureAlgorithm::RSA_PSS_RSAE_SHA512,
+    SslSignatureAlgorithm::RSA_PKCS1_SHA512,
+    SslSignatureAlgorithm::ED25519,
+    SslSignatureAlgorithm::ECDSA_SECP521R1_SHA512,
+    SslSignatureAlgorithm::RSA_PKCS1_SHA1,
+];
+
+/// The client context every dial on this leg shares — and the SAME one the
+/// ClientHello gate captures.
+///
+/// One constructor on purpose: the gate used to build its own copy of this
+/// configuration, so a setting added to the dialer (or missing from it) could
+/// not fail the test. The certificate store is the single thing the dialer
+/// adds afterwards, because it is verification and cannot reach the hello.
+fn client_connector() -> anyhow::Result<SslConnectorBuilder> {
+    let mut builder = SslConnector::builder(SslMethod::tls())
+        .map_err(|e| anyhow::anyhow!("BoringSSL client context: {e}"))?;
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .map_err(|e| anyhow::anyhow!("TLS 1.2 floor: {e}"))?;
+    // h1 only: the genuine client's ALPN list is exactly `http/1.1`, and
+    // the vendor answers it; offering h2 would change a field the origin
+    // can read.
+    builder
+        .set_alpn_protos(b"\x08http/1.1")
+        .map_err(|e| anyhow::anyhow!("ALPN http/1.1: {e}"))?;
+    builder.enable_ocsp_stapling();
+    builder.enable_signed_cert_timestamps();
+    builder
+        .set_verify_algorithm_prefs(&BUN_SIGALGS)
+        .map_err(|e| anyhow::anyhow!("Bun's signature algorithms: {e}"))?;
+    // No `set_grease_enabled`: BoringSSL ships GREASE off and Bun never turns
+    // it on, so enabling it here would MOVE away from the genuine hello.
+    Ok(builder)
+}
+
 impl VendorClient {
     pub fn new(server: &ServerConfig, max_inflight: Option<u32>) -> anyhow::Result<Self> {
-        let mut builder = SslConnector::builder(SslMethod::tls())
-            .map_err(|e| anyhow::anyhow!("BoringSSL client context: {e}"))?;
-        builder
-            .set_min_proto_version(Some(SslVersion::TLS1_2))
-            .map_err(|e| anyhow::anyhow!("TLS 1.2 floor: {e}"))?;
-        // h1 only: the genuine client's ALPN list is exactly `http/1.1`, and
-        // the vendor answers it; offering h2 would change a field the origin
-        // can read.
-        builder
-            .set_alpn_protos(b"\x08http/1.1")
-            .map_err(|e| anyhow::anyhow!("ALPN http/1.1: {e}"))?;
-        builder.enable_ocsp_stapling();
-        builder.enable_signed_cert_timestamps();
+        let mut builder = client_connector()?;
         // BoringSSL's default verify paths are a build-time OPENSSLDIR, which
         // on macOS points at nothing usable. The Mozilla bundle is what the
         // rustls path effectively verifies against, so it is what this one
@@ -291,10 +346,6 @@ impl VendorClient {
                 .map_err(|e| anyhow::anyhow!("webpki root rejected: {e}"))?;
         }
         builder.set_cert_store(roots.build());
-        // No `set_grease_enabled`: BoringSSL ships GREASE off and Bun never
-        // turns it on, so enabling it here would MOVE away from the genuine
-        // hello. Same for cipher/curve/sigalg lists: stock defaults ARE the
-        // fingerprint, and the JA3 gate is what keeps them from drifting.
         Ok(Self {
             inner: Arc::new(Inner {
                 connector: builder.build(),
@@ -1190,16 +1241,12 @@ mod tests {
     }
 
     fn connector() -> SslConnector {
-        let mut builder = SslConnector::builder(SslMethod::tls()).expect("client context");
-        builder
-            .set_min_proto_version(Some(SslVersion::TLS1_2))
-            .expect("TLS 1.2");
-        builder
-            .set_alpn_protos(b"\x08http/1.1")
-            .expect("ALPN http/1.1");
-        builder.enable_ocsp_stapling();
-        builder.enable_signed_cert_timestamps();
-        builder.build()
+        // The DIALER's own constructor, not a copy: a gate that rebuilds the
+        // configuration can certify something the dialer does not send, which
+        // is exactly how the signature-algorithm list went missing.
+        client_connector()
+            .expect("BoringSSL client context")
+            .build()
     }
 
     /// Capture exactly the bytes the mutual handshake puts on the wire,
@@ -1257,6 +1304,168 @@ mod tests {
             md5_hex(&inputs),
             GENUINE_JA3,
             "JA3 drifted from the measured genuine client"
+        );
+    }
+
+    /// The ClientHello fields a fingerprint can read, minus the values that
+    /// are random on every connection: `client_random`, the legacy session id,
+    /// and the key-share key material. Extension ORDER and each body's LENGTH
+    /// stay, because those are exactly what JA3 throws away — the
+    /// signature-algorithm BODY is the field this module drifted on while the
+    /// JA3 gate stayed green.
+    #[derive(Debug, PartialEq, Eq)]
+    struct HelloShape {
+        version: u16,
+        session_id_len: usize,
+        ciphers: Vec<u16>,
+        compression: Vec<u8>,
+        extensions: Vec<(u16, usize)>,
+        groups: Vec<u16>,
+        point_formats: Vec<u8>,
+        sigalgs: Vec<u16>,
+        alpn: Vec<u8>,
+        supported_versions: Vec<u16>,
+        key_share: Vec<(u16, usize)>,
+        server_name: Option<String>,
+    }
+
+    fn hello_shape(buf: &[u8]) -> HelloShape {
+        assert_eq!(buf[0], 22, "not a handshake record");
+        assert_eq!(buf[5], 1, "not a ClientHello");
+        let mut p = 9; // record header + handshake type/len
+        let version = u16::from_be_bytes([buf[p], buf[p + 1]]);
+        p += 2 + 32;
+        let session_id_len = buf[p] as usize;
+        p += 1 + session_id_len;
+        let ciphers_len = u16::from_be_bytes([buf[p], buf[p + 1]]) as usize;
+        p += 2;
+        let ciphers = (0..ciphers_len / 2)
+            .map(|i| u16::from_be_bytes([buf[p + i * 2], buf[p + i * 2 + 1]]))
+            .collect();
+        p += ciphers_len;
+        let compression = buf[p + 1..p + 1 + buf[p] as usize].to_vec();
+        p += 1 + buf[p] as usize;
+        let ext_total = u16::from_be_bytes([buf[p], buf[p + 1]]) as usize;
+        p += 2;
+        let end = p + ext_total;
+        let mut shape = HelloShape {
+            version,
+            session_id_len,
+            ciphers,
+            compression,
+            extensions: Vec::new(),
+            groups: Vec::new(),
+            point_formats: Vec::new(),
+            sigalgs: Vec::new(),
+            alpn: Vec::new(),
+            supported_versions: Vec::new(),
+            key_share: Vec::new(),
+            server_name: None,
+        };
+        while p + 4 <= end {
+            let kind = u16::from_be_bytes([buf[p], buf[p + 1]]);
+            let len = u16::from_be_bytes([buf[p + 2], buf[p + 3]]) as usize;
+            let body = &buf[p + 4..p + 4 + len];
+            shape.extensions.push((kind, len));
+            match kind {
+                0 => {
+                    let name_len = u16::from_be_bytes([body[3], body[4]]) as usize;
+                    shape.server_name = String::from_utf8(body[5..5 + name_len].to_vec()).ok();
+                }
+                10 => {
+                    let n = u16::from_be_bytes([body[0], body[1]]) as usize;
+                    shape.groups = (0..n / 2)
+                        .map(|i| u16::from_be_bytes([body[2 + i * 2], body[3 + i * 2]]))
+                        .collect();
+                }
+                11 => shape.point_formats = body[1..].to_vec(),
+                13 => {
+                    let n = u16::from_be_bytes([body[0], body[1]]) as usize;
+                    shape.sigalgs = (0..n / 2)
+                        .map(|i| u16::from_be_bytes([body[2 + i * 2], body[3 + i * 2]]))
+                        .collect();
+                }
+                16 => shape.alpn = body.to_vec(),
+                51 => {
+                    // The two-byte prefix is the LIST's length in BYTES
+                    // (RFC 8446 §4.2.8), not an entry count: at 1258 bytes
+                    // with two entries, counting entries walks off the end.
+                    let n = u16::from_be_bytes([body[0], body[1]]) as usize;
+                    let end = 2 + n;
+                    let mut q = 2;
+                    while q + 4 <= end {
+                        let group = u16::from_be_bytes([body[q], body[q + 1]]);
+                        let key_len = u16::from_be_bytes([body[q + 2], body[q + 3]]) as usize;
+                        shape.key_share.push((group, key_len));
+                        q += 4 + key_len;
+                    }
+                }
+                43 => {
+                    let n = body[0] as usize;
+                    shape.supported_versions = (0..n / 2)
+                        .map(|i| u16::from_be_bytes([body[1 + i * 2], body[2 + i * 2]]))
+                        .collect();
+                }
+                _ => {}
+            }
+            p += 4 + len;
+        }
+        shape
+    }
+
+    /// The shape captured from the genuine client (`opencode` 2.2.2, which
+    /// embeds Bun 1.4.4) on 2026-11-05, dialling SNI `opencode.ai`. Every
+    /// value that varies per connection is absent from this struct rather
+    /// than masked, so nothing random can fail the comparison.
+    ///
+    /// The signature list is Bun's, not BoringSSL's: Bun's usockets client
+    /// calls `SSL_CTX_set_verify_algorithm_prefs` with these eleven entries
+    /// when no `sigalgs` option is given (`us_ssl_ctx_set_verify_signature_
+    /// algorithms`), which is why [`BUN_SIGALGS`] exists.
+    fn genuine_shape() -> HelloShape {
+        HelloShape {
+            version: 0x0303,
+            session_id_len: 32,
+            ciphers: vec![
+                4865, 4866, 4867, 49195, 49199, 49196, 49200, 52393, 52392, 49161, 49171, 49162,
+                49172, 156, 157, 47, 53,
+            ],
+            compression: vec![0],
+            extensions: vec![
+                (0, 16),
+                (23, 0),
+                (65281, 1),
+                (10, 10),
+                (11, 2),
+                (35, 0),
+                (16, 11),
+                (5, 5),
+                (13, 24),
+                (18, 0),
+                (51, 1258),
+                (45, 2),
+                (43, 5),
+            ],
+            groups: vec![4588, 29, 23, 24],
+            point_formats: vec![0],
+            sigalgs: vec![
+                1027, 2052, 1025, 1283, 2053, 1281, 2054, 1537, 2055, 1539, 513,
+            ],
+            alpn: b"\x00\x09\x08http/1.1".to_vec(),
+            supported_versions: vec![0x0304, 0x0303],
+            key_share: vec![(4588, 1216), (29, 32)],
+            server_name: Some("opencode.ai".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn client_hello_matches_the_genuine_clients_full_shape() {
+        let hello = capture_client_hello().await;
+        assert_eq!(
+            hello_shape(&hello),
+            genuine_shape(),
+            "ClientHello drifted outside JA3's view (extension bodies, order, \
+             or lengths); the signature-algorithm list is BUN_SIGALGS"
         );
     }
 
