@@ -9,9 +9,15 @@
 # if the tree stops producing Bun's measured fingerprint.
 set -eu
 
-# scripts/build/deps/boringssl.ts:27 in oven-sh/bun (bun-v1.4.4).
+# scripts/build/deps/boringssl.ts in oven-sh/bun (bun-v1.4.4) — the release the
+# OpenCode client ships (its bundled runtime is Bun v1.4.4). BOTH lines are
+# provenance: `scripts/check-bun-pin.sh` asserts the checkout matches `commit`,
+# that this release tag still pins the same commit, and that the installed
+# client's embedded Bun version is this one.
+# shellcheck disable=SC2034  # read by scripts/check-bun-pin.sh
+bun_ref=bun-v1.4.4
 commit=41bf9b59c2ebf277a7aa427e1ecad5cc80dd4d4f
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+root=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
 dest="$root/vendor/boringssl"
 
 if [ -d "$dest/.git" ]; then

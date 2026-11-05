@@ -37,6 +37,10 @@ HK_MISE = "1"
 description = "Check out the BoringSSL commit Bun pins (the vendor leg's TLS identity)"
 run = "./scripts/fetch-boringssl.sh"
 
+[tasks.check-bun-pin]
+description = "Assert the vendored BoringSSL is the release the installed OpenCode client ships (PIN_CHECK_OFFLINE=1 skips the network leg)"
+run = "./scripts/check-bun-pin.sh"
+
 [hooks]
 # Registering the hooks is what makes hk.pkl real: without it the file is
 # documentation and every commit stays ungated. Runs on `mise install` (or
