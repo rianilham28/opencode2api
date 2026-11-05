@@ -233,6 +233,11 @@ pub struct VendorRequest {
     url: reqwest::Url,
     headers: Vec<(String, String)>,
     body: Bytes,
+    /// What this request asks the origin to encode. `identity` by default,
+    /// because a coded body cannot be pooled — but a body that is fetched
+    /// once and never reused (the model catalogue) is better compressed:
+    /// the same 96 KB answer shrinks to a tenth on a data-metered egress.
+    accept_encoding: &'static str,
 }
 
 impl VendorRequest {
@@ -242,6 +247,7 @@ impl VendorRequest {
             url,
             headers,
             body,
+            accept_encoding: ACCEPT_ENCODING,
         }
     }
 
@@ -251,6 +257,20 @@ impl VendorRequest {
             url,
             headers,
             body: Bytes::new(),
+            accept_encoding: ACCEPT_ENCODING,
+        }
+    }
+
+    /// A GET that asks for `gzip`: for a one-shot body the codec's cost to
+    /// connection reuse is nothing, and the bytes it saves are real.
+    pub fn get_encoded(
+        url: reqwest::Url,
+        headers: Vec<(String, String)>,
+        accept_encoding: &'static str,
+    ) -> Self {
+        Self {
+            accept_encoding,
+            ..Self::get(url, headers)
         }
     }
 }
@@ -892,7 +912,7 @@ fn build_head(
     out.push_str("Connection: keep-alive\r\n");
     out.push_str("Accept: */*\r\n");
     out.push_str(&format!("Host: {authority}\r\n"));
-    out.push_str(&format!("Accept-Encoding: {ACCEPT_ENCODING}\r\n"));
+    out.push_str(&format!("Accept-Encoding: {}\r\n", req.accept_encoding));
     if !req.body.is_empty() {
         out.push_str(&format!("Content-Length: {}\r\n", req.body.len()));
     }
@@ -1535,6 +1555,21 @@ mod tests {
                 "\r\n",
             )
         );
+    }
+
+    /// A one-shot GET can ask for gzip without losing anything: it is not a
+    /// connection the pool would reuse.
+    #[test]
+    fn an_encoded_get_asks_for_its_codec() {
+        let url = reqwest::Url::parse("https://opencode.ai/inference/v1/models").unwrap();
+        let head = build_head(
+            &VendorRequest::get_encoded(url, vec![], "gzip"),
+            false,
+            None,
+        )
+        .expect("head builds");
+        let head = std::str::from_utf8(&head).unwrap();
+        assert!(head.contains("Accept-Encoding: gzip\r\n"), "{head}");
     }
 
     /// `http://` through a proxy is written in absolute form with the proxy's

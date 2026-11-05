@@ -638,7 +638,15 @@ impl OpenAiProvider {
         } else {
             self.authenticate(&mut headers, None)?
         };
-        let req = opencode2api_transport::vendor::VendorRequest::get(self.models_url(), headers);
+        // The catalogue is ~96 KB of JSON fetched once per TTL and never
+        // reused as a connection, so compression is pure savings on a
+        // data-metered egress; `identity` exists to protect pooling, which
+        // this one-shot body has nothing to protect.
+        let req = opencode2api_transport::vendor::VendorRequest::get_encoded(
+            self.models_url(),
+            headers,
+            "gzip",
+        );
         let resp = self.vendor.send(&lane, req).await.map_err(|e| {
             match e.fault {
                 opencode2api_transport::SendFault::Lane => lane.note_failure(),
