@@ -368,8 +368,10 @@ fn env_block() -> String {
 /// appended only when the caller did not send a tool with that exact name.
 ///
 /// The shape is the full OpenAI function wrapper, not the bare
-/// `{"name":"read"}` the gate also accepts: measured 2026-10-25, some upstream
-/// models validate the tool schema strictly and answer
+/// `{"name":"read"}` the gate also accepts, AND it carries a `description`:
+/// measured 2026-10-25, some upstream models validate the tool schema strictly
+/// (a strict renderer types `description` as `str` and rejects the request
+/// when it is null — pulse-alpha-free, 2026-11-05) and answer
 /// `400 missing_required_param tools[0].type` for the bare form (`beam-free`),
 /// while the wrapper passes on every model tested (`deepseek-v4.1-flash-free`,
 /// `beam-free`). Gate acceptance and model acceptance are different bars.
@@ -381,7 +383,16 @@ fn env_block() -> String {
 fn gate_read_tool() -> Value {
     json!({
         "type": "function",
-        "function": { "name": "read", "parameters": { "type": "object", "properties": {} } }
+        "function": {
+            "name": "read",
+            // A STRING, always: strict upstream renderers type this field and
+            // answer `400 could not render this request: 'None' is not an
+            // instance of 'str'` for a tool without one (measured on
+            // pulse-alpha-free, 2026-11-05: identical body, description added
+            // → 200, removed → 400). The genuine client's tools all carry one.
+            "description": "Read the contents of a file from disk.",
+            "parameters": { "type": "object", "properties": {} }
+        }
     })
 }
 
@@ -1127,7 +1138,11 @@ impl OpenAiProvider {
             .iter()
             .any(|tool| tool.get("name").and_then(Value::as_str) == Some("read"))
         {
-            tools.push(gate_read_tool());
+            // This dialect's tools are FLAT (`{type, name, description,
+            // parameters}`), so the gate entry goes through the same mapper the
+            // caller's tools do — a nested wrapper here is a shape the
+            // Responses API does not document.
+            tools.push(flat_tool(&gate_read_tool()));
         }
         map.insert("tools".into(), Value::Array(tools));
         for key in ["temperature", "top_p", "stop", "parallel_tool_calls"] {
@@ -3532,6 +3547,46 @@ mod tests {
         assert_ne!(header(&second, "x-opencode-project"), Some(project));
     }
 
+    /// The appended `read` must carry a DESCRIPTION: a strict upstream
+    /// renderer types that field and rejects the whole request when it is
+    /// absent, so a shape that passes the free-tier gate can still fail on a
+    /// model (`pulse-alpha-free`: identical body, description added → 200,
+    /// removed → 400 prefill_bad_request). The Responses dialect also spells
+    /// its tools flat, so the gate entry is mapped like the caller's.
+    #[test]
+    fn the_appended_gate_read_carries_a_description_in_each_spelling() {
+        let chat: ChatRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "x"}]
+        }))
+        .unwrap();
+        let body = provider("https://x.test/v1").to_upstream_body(&chat);
+        let function = &body["tools"][0]["function"];
+        assert_eq!(function["name"], "read");
+        assert!(
+            function["description"]
+                .as_str()
+                .is_some_and(|d| !d.is_empty()),
+            "the chat gate tool needs a string description: {function}"
+        );
+
+        let responses: ChatRequest = serde_json::from_value(json!({
+            "model": "muse-spark-1.3-contributor-free",
+            "messages": [{"role": "user", "content": "x"}]
+        }))
+        .unwrap();
+        let body = provider("https://x.test/v1").to_upstream_body(&responses);
+        let tool = &body["tools"][0];
+        assert_eq!(tool["name"], "read", "responses tools are flat: {tool}");
+        assert!(
+            tool.get("function").is_none(),
+            "no nested wrapper in this dialect: {tool}"
+        );
+        assert!(
+            tool["description"].as_str().is_some_and(|d| !d.is_empty()),
+            "the responses gate tool needs a string description: {tool}"
+        );
+    }
+
     #[test]
     fn upstream_body_forces_stream_and_appends_the_gate_read() {
         let req: ChatRequest = serde_json::from_value(json!({
@@ -3984,8 +4039,8 @@ mod tests {
         let tools = body["tools"].as_array().expect("flat tools");
         assert_eq!(
             tools,
-            &vec![super::gate_read_tool()],
-            "the gate's bare read"
+            &vec![super::flat_tool(&super::gate_read_tool())],
+            "the gate's bare read, in this dialect's flat spelling"
         );
         assert!(
             body.get("max_tokens").is_none(),
