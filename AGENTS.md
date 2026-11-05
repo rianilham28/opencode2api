@@ -39,7 +39,11 @@ crates/
    (so a proxy identity cannot vary per request) and because the lanes are
    ONE warm pool shared by every provider in the process. The provider's only
    say in it: reporting which failures were the LANE's fault.
-6. **A proxy vendor's session syntax is data until it isn't.** Every vendor
+6. **A proxy vendor's session syntax is data until it isn't, and its
+   credentials are environment, not config.** A vendor URL may spell its
+   secret as `{env:NAME}`: the shape and the name stay committable, the value
+   lives in `.env`, and an unset variable is a boot failure that names the
+   variable rather than rendering an empty password. Every vendor
    seen so far puts the session id in the proxy URL's username
    (`…-session-{session}-ttl-60`, `…-network-eco-sid-{session}-ttl-60`), so a
    URL template covers them from config — and the TTL UNIT differs per vendor

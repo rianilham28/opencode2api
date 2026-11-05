@@ -389,7 +389,15 @@ impl ProxyConfig {
                 ..Default::default()
             });
         }
-        if let Some(cfg) = &cfg {
+        if let Some(cfg) = &mut cfg {
+            // Credentials resolve at BOOT, not per mint: a named vendor whose
+            // password is missing must fail startup (the same rule a
+            // malformed `base_url` follows), and resolving once means the
+            // request path never touches the environment.
+            for (i, vendor) in cfg.vendors.iter_mut().enumerate() {
+                vendor.url = resolve_env_placeholders(&vendor.url)
+                    .map_err(|e| anyhow::anyhow!("proxy.vendors[{i}]: {e}"))?;
+            }
             cfg.validate()?;
         }
         Ok(cfg)
@@ -467,6 +475,43 @@ impl ProxyConfig {
 }
 
 // ── the vendor seam ──────────────────────────────────────────────────────
+
+/// Replace every `{env:NAME}` in a vendor URL with the named environment
+/// variable's value, so a NAMED vendor can live in a committed config while
+/// its password stays in `.env` — the split every other credential in this
+/// repo already follows.
+///
+/// Deliberately boot-time and deliberate about failure: an unset or empty
+/// variable is an error naming the VARIABLE (never the URL, and never a
+/// value), because a vendor that silently rendered an empty password would
+/// boot into 407s rather than into a message that says what to set.
+fn resolve_env_placeholders(url: &str) -> anyhow::Result<String> {
+    let mut out = String::with_capacity(url.len());
+    let mut rest = url;
+    while let Some(start) = rest.find("{env:") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "{env:".len()..];
+        let Some(end) = after.find('}') else {
+            anyhow::bail!("url has an unterminated {{env: placeholder");
+        };
+        let name = &after[..end];
+        anyhow::ensure!(
+            name.bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+            "url names an invalid environment variable {name:?}"
+        );
+        let value = std::env::var(name).ok().filter(|v| !v.is_empty());
+        let Some(value) = value else {
+            anyhow::bail!("url needs {{env:{name}}}, but {name} is unset or empty");
+        };
+        out.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
 
 /// How one proxy vendor spells a sticky session. Implement this only for a
 /// vendor that cannot be expressed as a URL template (session in a header, a
@@ -2015,6 +2060,66 @@ mod tests {
         let urls: Vec<&str> = cfg.vendors.iter().map(|v| v.url.as_str()).collect();
         assert!(urls.iter().any(|u| u.contains("{ttl_seconds}")), "{urls:?}");
         assert!(urls.iter().any(|u| u.contains("{ttl_minutes}")), "{urls:?}");
+    }
+
+    /// A credential hole keeps the password out of the config file: the
+    /// vendor is NAMED, its shape is committed, and `{env:NAME}` resolves
+    /// from the environment at boot.
+    #[test]
+    fn a_named_vendor_takes_its_password_from_the_environment() {
+        struct Var(&'static str);
+        impl Drop for Var {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var(self.0) };
+            }
+        }
+        let _lock = env_lock();
+        let _env = EnvGuard::set(&[]);
+        const NAME: &str = "PROXIWARE_PASSWORD";
+        unsafe { std::env::set_var(NAME, "s3cret") };
+        let _var = Var(NAME);
+        let doc = serde_json::json!({"proxy": {"vendors": [{
+            "name": "proxiware",
+            "url": "http://user-acc-network-eco-sid-{session}-ttl-{ttl_minutes}:{env:PROXIWARE_PASSWORD}@proxy.proxiware.com:1337",
+            "lanes": 2,
+            "session_ttl_secs": 600,
+            "session_len": 7
+        }]}});
+        let cfg = ProxyConfig::from_doc(&doc)
+            .expect("the secret resolves")
+            .expect("a pool is configured");
+        let vendor = &cfg.vendors[0];
+        assert_eq!(vendor.name, "proxiware");
+        assert!(vendor.url.contains(":s3cret@"), "the secret is substituted");
+        assert!(
+            vendor.url.contains("{session}"),
+            "the session hole survives resolution"
+        );
+        let lane = TemplateVendor::new(vendor).lane_url("1234567");
+        assert!(lane.contains("sid-1234567-ttl-10"), "{lane}");
+        assert!(!lane.contains("{env:"), "{lane}");
+    }
+
+    /// A missing secret is a BOOT failure that names the variable — and
+    /// never the URL, which carries the account and the host.
+    #[test]
+    fn an_unset_vendor_secret_fails_boot_without_echoing_the_url() {
+        let _lock = env_lock();
+        let _env = EnvGuard::set(&[]);
+        unsafe { std::env::remove_var("PROXIWARE_PASSWORD") };
+        let doc = serde_json::json!({"proxy": {"vendors": [{
+            "name": "proxiware",
+            "url": "http://user-acc-sid-{session}:{env:PROXIWARE_PASSWORD}@proxy.proxiware.com:1337",
+            "lanes": 1,
+            "session_ttl_secs": 600
+        }]}});
+        let err = ProxyConfig::from_doc(&doc).unwrap_err().to_string();
+        assert!(err.contains("proxy.vendors[0]"), "{err}");
+        assert!(err.contains("PROXIWARE_PASSWORD"), "{err}");
+        assert!(
+            !err.contains("proxy.proxiware.com"),
+            "the url must not leak: {err}"
+        );
     }
 
     #[test]

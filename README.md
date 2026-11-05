@@ -530,7 +530,7 @@ subsystems grow):
      "url": "http://ACCOUNT-session-{session}-ttl-{ttl_seconds}:PW@dc.us-pr.plainproxies.com:1338",
      "lanes": 4, "session_ttl_secs": 600, "session_len": 6},
     {"name": "proxiware",
-     "url": "http://user-ACCOUNT-network-eco-sid-{session}-ttl-{ttl_minutes}:PW@proxy.proxiware.com:1337",
+     "url": "http://user-ACCOUNT-network-eco-sid-{session}-ttl-{ttl_minutes}:{env:PROXIWARE_PASSWORD}@proxy.proxiware.com:1337",
      "lanes": 4, "session_ttl_secs": 3600, "session_len": 7}
   ],
   "rotate_at_pct": 80, "prewarm": true
@@ -542,6 +542,12 @@ What each part is defending:
 - **`{session}` is required.** Without it every lane shares one exit IP and
   rotation does nothing, so the config is rejected at boot rather than
   quietly degraded.
+- **`{env:NAME}` names a secret instead of carrying it.** The value is read
+  from the environment once at boot (so `.env` is the file that holds it, and
+  the `proxy.vendors` block can be committed), an unset or empty variable
+  fails startup naming the VARIABLE — never the URL — and a vendor can mix it
+  with the other placeholders. `OPENCODE2API_PROXY_URL` replaces the whole
+  `vendors` array, so use one form or the other.
 - **`{ttl_seconds}` / `{ttl_minutes}`** exist because the unit is per vendor
   (plainproxies spells seconds, proxiware minutes). `session_ttl_secs` is the
   one authoritative number; the template renders it in the vendor's own unit
