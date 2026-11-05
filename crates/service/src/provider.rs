@@ -732,10 +732,30 @@ impl OpenAiProvider {
             .map_or(requested, String::as_str)
     }
 
-    /// Which dialect this vendor id is answered in: the muse-spark free
-    /// models answer only `/responses`, everything else the chat endpoint.
+    /// Which dialect this vendor id is answered in, preferring the catalogue's
+    /// own `api` metadata and falling back to the ids measured to answer only
+    /// over Responses.
+    ///
+    /// The fallback matters on the paths that run before the first catalogue
+    /// fetch, and for ids the free-tier list never shows (aliases and
+    /// non-free models, which are forwarded rather than filtered).
+    fn style_for(&self, vendor: &str) -> Style {
+        let catalogued = self
+            .catalogue_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .style(vendor);
+        catalogued.unwrap_or_else(|| {
+            if is_responses_style(vendor) {
+                Style::Responses
+            } else {
+                Style::Chat
+            }
+        })
+    }
+
     fn upstream_url(&self, vendor: &str) -> reqwest::Url {
-        if is_responses_style(vendor) {
+        if self.style_for(vendor) == Style::Responses {
             self.responses_url.clone()
         } else {
             self.chat_url.clone()
@@ -991,7 +1011,7 @@ impl OpenAiProvider {
     /// dialect, everything else the chat dialect.
     fn to_upstream_body(&self, req: &ChatRequest) -> Value {
         let vendor = self.vendor_model(&req.model);
-        if is_responses_style(vendor) {
+        if self.style_for(vendor) == Style::Responses {
             self.responses_body(req, vendor)
         } else {
             self.chat_body(req, vendor)
@@ -1333,9 +1353,12 @@ fn models_base(base: &str) -> String {
     }
 }
 
-/// The vendor ids answered ONLY by the Responses dialect — a chat call on
-/// them 500s upstream (live-probed), so this split is keyed on the id after
-/// `model_map`, never on the client's alias.
+/// The ids measured to answer ONLY over the Responses dialect, used as the
+/// fallback when the catalogue has no row for a model (before the first
+/// fetch, or a non-free id that is forwarded). The catalogue's own `api`
+/// metadata wins whenever it is present — see [`style_of`] — because this
+/// list is exactly what goes stale when upstream renames or retires a free
+/// model: the two ids below no longer exist in the free tier at all.
 fn is_responses_style(vendor: &str) -> bool {
     matches!(
         vendor,
@@ -1791,6 +1814,35 @@ fn withhold_unavailable(
     value
 }
 
+/// The upstream surface a vendor model answers on, as the CATALOGUE spells it
+/// (`api.chat-completions` / `api.responses`). The catalogue is the only thing
+/// that knows: free ids and their endpoints change upstream without this proxy
+/// shipping a release, and a hand-written model list goes stale silently (the
+/// previous hard-coded pair named two ids that no longer exist in the free
+/// tier at all).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Style {
+    Chat,
+    Responses,
+}
+
+/// One catalogue row's style. A model that offers `chat-completions` answers
+/// chat even if it also has a Responses face — the chat lane is the one every
+/// dialect folds onto, and the Responses lane exists only for models that
+/// cannot chat. Rows offering neither (an Anthropic- or Gemini-only model)
+/// are not style-mapped: they fall through to the chat lane, which is where
+/// the forward-the-answer policy already puts non-free ids.
+fn style_of(entry: &Value) -> Option<Style> {
+    let api = entry.get("api")?.as_object()?;
+    if api.contains_key("chat-completions") {
+        Some(Style::Chat)
+    } else if api.contains_key("responses") {
+        Some(Style::Responses)
+    } else {
+        None
+    }
+}
+
 /// The last RAW `/models` answer (post-fetch, pre-transform), so a flapping
 /// upstream cannot flap the list endpoint. The transforms — aliases,
 /// free-only, suppression — run fresh per request off whichever copy serves.
@@ -1798,6 +1850,9 @@ fn withhold_unavailable(
 struct CatalogCache {
     raw: Option<Arc<Value>>,
     fetched_at: Option<Instant>,
+    /// Model id -> upstream surface, derived ONCE per stored answer: the
+    /// request path must not walk the list to find one model.
+    styles: HashMap<String, Style>,
 }
 
 impl CatalogCache {
@@ -1811,8 +1866,26 @@ impl CatalogCache {
     }
 
     fn store(&mut self, raw: Value) {
+        self.styles = raw
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let id = entry.get("id").and_then(Value::as_str)?;
+                        Some((id.to_string(), style_of(entry)?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         self.raw = Some(Arc::new(raw));
         self.fetched_at = Some(Instant::now());
+    }
+
+    /// The catalogued surface for one vendor id, if the list has it.
+    fn style(&self, vendor: &str) -> Option<Style> {
+        self.styles.get(vendor).copied()
     }
 
     /// The last-good copy at ANY age — what a failed refetch serves.
@@ -1845,7 +1918,7 @@ impl Provider for OpenAiProvider {
         if resp.is_sse() {
             // The gate forces every request to stream, so a buffered client's
             // completion is a fold over the very SSE the stream path decodes.
-            let mut completion = if is_responses_style(vendor) {
+            let mut completion = if self.style_for(vendor) == Style::Responses {
                 fold_completion(
                     decode_responses_sse(resp.into_chunks(), max, vendor, touch),
                     restore,
@@ -1869,7 +1942,7 @@ impl Provider for OpenAiProvider {
         let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
             ProviderError::permanent_bad_gateway(format!("upstream body was not JSON: {e}"))
         })?;
-        let mut completion = if is_responses_style(vendor) {
+        let mut completion = if self.style_for(vendor) == Style::Responses {
             let mut completion = completion_from_responses(value, vendor)?;
             restore_requested_model(&mut completion.model, restore.as_ref());
             completion
@@ -1891,7 +1964,7 @@ impl Provider for OpenAiProvider {
         let (resp, touch) = self.send(self.upstream_url(vendor), body, ctx).await?;
         let max = self.cfg.response_ceiling();
         let restore = model_restore(&req.model, &self.cfg.model_map);
-        if is_responses_style(vendor) {
+        if self.style_for(vendor) == Style::Responses {
             to_ir_stream_responses(resp, max, vendor, restore, touch).await
         } else {
             let ir = to_ir_stream(resp, max, restore, touch).await?;
@@ -1919,7 +1992,7 @@ impl Provider for OpenAiProvider {
         ctx: &CallContext<'_>,
     ) -> Result<ChunkStream, ProviderError> {
         let vendor = self.vendor_model(&req.model);
-        if is_responses_style(vendor) {
+        if self.style_for(vendor) == Style::Responses {
             return Err(ProviderError::unsupported("raw stream relay"));
         }
         let body = self.to_upstream_body(req);
@@ -4159,6 +4232,63 @@ mod tests {
         );
         let last_good = cache.stale().expect("last-good copy at any age");
         assert_eq!(listed_ids(&last_good), ["mimo-v2.5-free"]);
+    }
+
+    /// The upstream surface comes from the catalogue's own `api` object, so a
+    /// model moving between chat and Responses upstream needs no release here.
+    #[test]
+    fn catalogue_metadata_decides_the_upstream_style() {
+        let mut cache = CatalogCache::default();
+        cache.store(json!({"object": "list", "data": [
+            {"id": "both-free", "api": {"chat-completions": {"base_url": "x"}, "responses": {"base_url": "x"}}},
+            {"id": "responses-only", "api": {"responses": {"base_url": "x"}}},
+            {"id": "messages-only", "api": {"messages": {"base_url": "x"}}},
+            {"id": "no-api"}
+        ]}));
+        assert_eq!(
+            cache.style("both-free"),
+            Some(Style::Chat),
+            "chat wins when a model offers both: it is the lane every dialect folds onto"
+        );
+        assert_eq!(cache.style("responses-only"), Some(Style::Responses));
+        assert_eq!(
+            cache.style("messages-only"),
+            None,
+            "an Anthropic-only row is not style-mapped; the forward policy stays in charge"
+        );
+        assert_eq!(cache.style("no-api"), None);
+        assert_eq!(cache.style("absent"), None);
+    }
+
+    /// The catalogue outranks the hard-coded fallback, and the fallback still
+    /// answers before the first fetch and for ids the list never shows.
+    #[test]
+    fn catalogued_style_overrides_the_hard_coded_fallback() {
+        let provider = zen_provider();
+        assert_eq!(
+            provider.style_for("muse-spark-1.2-contributor-free"),
+            Style::Responses,
+            "no catalogue yet: the measured fallback answers"
+        );
+        provider
+            .catalogue_cache
+            .lock()
+            .unwrap()
+            .store(json!({"object": "list", "data": [
+                {"id": "muse-spark-1.2-contributor-free", "api": {"chat-completions": {"base_url": "x"}}},
+                {"id": "free-both", "api": {"chat-completions": {"base_url": "x"}}}
+            ]}));
+        assert_eq!(
+            provider.style_for("muse-spark-1.2-contributor-free"),
+            Style::Chat,
+            "the catalogue is the newer truth"
+        );
+        assert_eq!(provider.style_for("free-both"), Style::Chat);
+        assert_eq!(
+            provider.style_for("not-in-the-list"),
+            Style::Chat,
+            "an unmapped id forwards down the chat lane"
+        );
     }
 
     // ── verbatim-lane DONE trim ─────────────────────────────────────────
