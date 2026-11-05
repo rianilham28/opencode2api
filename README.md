@@ -13,8 +13,8 @@ dialects. All vendor behavior lives, as code, in exactly one file:
 | Listen | `127.0.0.1:10081` (`server.port` in `config.json`) |
 | Upstream | `https://opencode.ai/inference/openai/v1` — chat style at `…/chat/completions`, responses style at `…/responses`; the model LIST is served only on the legacy `https://opencode.ai/inference/v1/models` (measured 2026-10-25: `…/openai/v1/models` → 404), which is why `provider.models_url` exists (the old `/zen/v1` root is dead upstream: it 403s every caller, genuine identity included) |
 | Model surface | **`-free` ids only**: `/v1/models` keeps ids ending `-free`; the catalogue is fetched from upstream at most once per 900s (cached, stale-served on upstream error), and a model upstream reports `Model is unavailable` is withheld from the list for 900s, extended by every repeat — still forwarded if a client asks for it directly |
-| Style split | `muse-spark-1.2-contributor-free` / `muse-spark-1.3-contributor-free` answer **only** over the Responses upstream (chat 500s upstream, live-probed); every other free id rides `/chat/completions` |
-| Upstream identity | the parts upstream actually reads, **pinned and minimal** (extreme matrix, 2026-10-25): a `user-agent` of three slash-separated segments starting `opencode/` (`opencode/9.9.9/cli` passes; `opencode`, `curl/8`, absent fail), a tool whose name is exactly `read`, `stream: true`, and a `<env>` block in a system message. `x-opencode-session` + `x-session-affinity` carry a session minted per process in opencode's own shape (`ses_` + 12 hex of the inverted ms clock + 14 base62); `authorization` is optional (`Bearer public` is what the genuine client sends), and the rest of the 2.x header set rides for fidelity. |
+| Style split | learned from the **catalogue's own `api` object** (`api.chat-completions` → chat, else `api.responses` → responses), so a model that moves between upstream surfaces needs no release here. The measured fallback — `muse-spark-1.2-contributor-free` / `muse-spark-1.3-contributor-free` answer **only** over the Responses upstream (chat 500s upstream, live-probed) — still covers ids the list does not show and the window before the first fetch. (Both of those ids have since left the free tier; the catalogue is now the source of truth.) |
+| Upstream identity | the parts upstream actually reads, **pinned and minimal** (extreme matrix, 2026-10-25; re-captured against opencode 2.2.2 on 2026-11-05): a `user-agent` of slash-separated segments starting `opencode/` (`opencode/latest/2.2.2/cli` is what the captured client sends; `opencode/9.9.9/cli` passes the gate, `opencode`, `curl/8`, absent fail), a tool whose name is exactly `read`, `stream: true`, and a `<env>` block in a system message. `x-opencode-session` + `x-session-affinity` carry a session minted per process in opencode's own shape (`ses_` + 12 hex of the inverted ms clock + 14 base62), and `b3` + `traceparent` carry one per-process trace with a fresh span per request, exactly as the genuine client sends them. `authorization` is optional (`Bearer public` is what the genuine client sends), and the rest of the 2.x header set rides for fidelity. |
 | Free-tier gate | `stream: true` is mandatory (buffered → folded back; the post-`[DONE]` `cost` frame never reaches clients) and the `tools` array must contain an entry named exactly **`read`** — parameters, description and the wrapper are unconstrained (`{"name":"read"}` suffices), `READ`/`Read` alone fails, zero tools fails. Foreign tools and arbitrary extra tools pass. `tool_choice:"none"` is never relayed. `429 FreeUsageLimitError` is what a body without the `<env>` block gets, so it is not only a quota signal. |
 | Tool handling | **the caller's tools are relayed verbatim**; a bare `{"name":"read"}` is appended only when the caller declared none, so Cline/Claude Code/Cursor tool calling keeps working. A caller with no file-read tool also gets a one-line note that the appended `read` is a gateway placeholder. When the model calls `read` and the caller declared its own reader under another name (`Read`/`read_file`), the call is renamed into it and `path` is mapped to the caller's field (`file_path`, …). |
 | Client dialects | `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1beta/models/…` — all fold through the IR |
@@ -96,6 +96,9 @@ AGENTS.md                  boundary doctrine — read before editing
 # The vendor leg's TLS is BoringSSL at the commit Bun pins. `mise install` runs
 # this for you; a bare `cargo build` on a fresh clone needs it first.
 ./scripts/fetch-boringssl.sh
+# Is that still the runtime the installed OpenCode client ships? Checks the
+# checkout, the Bun release tag, and the client's embedded Bun version.
+./scripts/check-bun-pin.sh
 
 cp config.example.json config.json      # the SHAPE: urls, lanes, limits
 cp .env.example .env                    # the SECRETS: keys, proxy passwords
@@ -288,6 +291,13 @@ Metrics worth alerting on:
   body that dies mid-flight) can retire an exit IP. A spike here is a slow
   upstream, not a dead proxy — retiring lanes on it is how three slow
   generations used to cost three healthy sessions.
+- `opencode2api_vendor_connections_total{vendor,kind}` (`new|reused`) and
+  `opencode2api_vendor_handshake_seconds{vendor}` — the vendor leg's own TLS
+  cost. The handshake is the identity and the reason each lane is prewarmed;
+  these are the pair that says whether keep-alive is actually working (a `new`
+  per request on a warm lane means pooling broke) and what a handshake costs in
+  wall-clock time. TLS only: the TCP connect and the proxy CONNECT have their
+  own budgets and their own failure classes.
 
 What the template refuses to generalize is *policy*, and in both pools the
 seam for it is code in the provider crate, not a fork of the core. The egress
@@ -321,7 +331,7 @@ grows a typed field first. Never config knobs, never shared-crate branches.
 | Special (source-verified) | Where it lands |
 |---|---|
 | **A `<env>` block is part of the body credential**: the free tier answers `429 FreeUsageLimitError` unless SOME system message carries a literal `<env>…</env>` pair containing `Working directory:` — content around it is free-form, the path value is free or empty, `<environment>`, `<env x="1">` and `Working Directory:` fail, and a first pair that is empty poisons the request (measured 2026-10-25) | `provider.rs::chat_body` SYNTHESIZES `<env>Working directory: /</env>`: any existing valid pair in a system message rides untouched; otherwise it is appended to the first system message (prepended when that message already holds an unusable `<env>`); with no system message one is created. |
-| **The handshake is the transport credential**: opencode.ai answers `200` to a byte-identical request over Bun's BoringSSL and `429 FreeUsageLimitError` over OpenSSL/rustls (measured 2026-10-25) | `opencode2api-transport::vendor` — BoringSSL at Bun's pinned commit, stock cipher/curve/sigalg/GREASE settings, ALPN `http/1.1` only, and a hand-written HTTP/1.1 head (names sorted byte-wise, case preserved). The provider only chooses the lane and the payload; the JA3 test is the drift gate. |
+| **The handshake is the transport credential**: opencode.ai answers `200` to a byte-identical request over Bun's BoringSSL and `429 FreeUsageLimitError` over OpenSSL/rustls (measured 2026-10-25) | `opencode2api-transport::vendor` — BoringSSL at Bun's pinned commit with the genuine client's settings (stock ciphers/groups/GREASE off, and Bun's own 11-entry verification-signature list, which BoringSSL's default is NOT), ALPN `http/1.1` only, and a hand-written HTTP/1.1 head (names sorted byte-wise, case preserved). The provider only chooses the lane and the payload. Two gates hold it: JA3 (`client_hello_is_the_genuine_clients_ja3`) and the full shape (`client_hello_matches_the_genuine_clients_full_shape`), because JA3 cannot see extension 13's body — the axis on which this leg drifted silently once. |
 | **DeepSeek thinking mode with `tools` 400s unless EVERY prior assistant turn carries `reasoning_content`** — not only the ones with `tool_calls` (`deepseek.md` §2) | **Chat dialect: automatic** — messages relay unparsed, so a client that replays it just works (pinned by `deepseek_reasoning_content_and_tools_replay_verbatim`). Anthropic and Responses bridges now replay a present `reasoning_content`; no bridge invents the key. A present-but-empty field is vendor/provider work (G7): inject it in a provider crate's `to_upstream_body`, never in a bridge that must not know which upstream answered. |
 | DeepSeek keeps `max_tokens`, adds `thinking{type}` + `reasoning_effort` (`medium`→`high` mapped), `reasoning_content` rides in stream deltas | Chat dialect: `extra` flattening passes all through verbatim; the relay already injects `stream_options.include_usage`. |
 | **OpenAI deprecates `max_tokens` for o-series** (use `max_completion_tokens`); non-US regions reject `store=true` (`openai.md`) | `to_upstream_body` in a provider crate — a per-model rename in code when you care about o-series; NOT a ServerConfig knob. |
@@ -480,10 +490,15 @@ can answer a byte-identical request `200` over Bun's TLS stack and `429` over
 rustls, so the handshake IS part of the credential, and hyper/reqwest cannot
 carry it (they lowercase and reorder headers). Providers reach it through
 `Transport::vendor_client(cap).send(lane, request)`; the dialer knows nothing
-about any vendor's payload laws, which stay in the provider. The JA3 test
-(`client_hello_is_the_genuine_clients_ja3`) captures the hello on loopback and
-fails on drift, so a BoringSSL or configuration change is a red test rather
-than an outage. Encoded response bodies are decoded but never pooled (a codec
+about any vendor's payload laws, which stay in the provider. Two gates capture
+the hello on loopback and fail on drift — JA3
+(`client_hello_is_the_genuine_clients_ja3`) and the full parsed shape
+(`client_hello_matches_the_genuine_clients_full_shape`, which covers extension
+order, body lengths, signature algorithms, groups, ALPN and supported
+versions, none of which JA3 can see) — so a BoringSSL or configuration change
+is a red test rather than an outage. The dialer and the gates share ONE
+connector constructor (`client_connector`), because a gate that rebuilds the
+configuration can certify a hello the dialer never sends. Encoded response bodies are decoded but never pooled (a codec
 stops at its own footer, before the HTTP framing terminal), so the leg ASKS for
 `identity`: measured on the JSON endpoints (2026-10-25), the client's four
 codings cost ~760 ms per `/inference/v1/models` request (no reuse — every call

@@ -420,8 +420,16 @@ truth for which; README "Quick start" lists the common ones.
   `Transport::vendor_client(cap)` for a handle and send through it; the dialer
   never learns a vendor's payload laws (those stay in the provider), and no
   caller builds a `reqwest` request for a gated upstream. Do not "improve" the
-  hello — no GREASE, no cipher/curve/sigalg list, no h2 ALPN: the JA3 test is
-  what holds it to the measured client, and drift must be a red test.
+  hello: GREASE stays off, no h2 ALPN, no cipher or curve list — and the ONE
+  departure from a BoringSSL default is toward the measured client, not away
+  from it: `BUN_SIGALGS` is Bun's own 11-entry verification list, because
+  BoringSSL's stock nine-entry list is NOT what the genuine client sends and
+  the difference hides inside extension 13, which JA3 does not hash. The
+  invariant is "match the MEASURED client", not "match stock defaults"; a
+  second gate compares the full parsed hello (extension order, body lengths,
+  sigalgs, groups, ALPN, versions) and both gates build their context from
+  `client_connector()`, the dialer's own constructor, so a gate can never
+  certify a configuration the dialer does not use.
   Encoded response bodies are decoded but never pooled (a codec ends before
   the HTTP framing terminal); identity bodies are. `provider.max_inflight` is
   the UNMEASURED concurrency ceiling — it queues, never sheds. The BODY is a
