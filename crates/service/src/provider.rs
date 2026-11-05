@@ -855,6 +855,13 @@ impl OpenAiProvider {
     }
 
     fn cooldown(err: &ProviderError) -> Option<std::time::Duration> {
+        // A REGION refusal is about the exit IP's country, not the key: the
+        // credential is fine elsewhere, and cooling it would park a good key
+        // (with one key the pool-of-one invariant hides it; with several it
+        // would take the deployment down for five minutes).
+        if region_blocked(err) {
+            return None;
+        }
         match err.status {
             429 => Some(Duration::from_secs(err.retry_after.unwrap_or(30))),
             401 | 403 => Some(Duration::from_secs(300)),
@@ -1296,6 +1303,14 @@ impl OpenAiProvider {
             Ok(resp) => Ok((UpstreamResponse(resp), touch)),
             Err(error) => {
                 let mut touch = touch;
+                // The free tier's allowance belongs to the EXIT IP, so its own
+                // `FreeUsageLimitError` is evidence about the lane and the
+                // provider is the only layer that can read it. Reporting it
+                // here turns "sit on a spent IP until the TTL" (up to rotation)
+                // into "replaced at the next maintenance tick".
+                if quota_exhausted(&error) || region_blocked(&error) {
+                    touch.lane.note_spent();
+                }
                 if touch.classify_body_error(&error) {
                     touch.transport_error();
                 } else {
@@ -1320,6 +1335,31 @@ const VENDOR_RETRY_PAUSES: [Duration; 2] =
 /// around these. NOT the IP's quota (`FreeUsageLimitError`) nor a token
 /// throttle (`rate_limit_exceeded`): those want another egress IP, which
 /// only a balancer in front can give.
+/// The vendor's per-exit free-tier quota is gone: its own envelope says so,
+/// and that is a fact about the LANE's exit IP rather than about the
+/// credential. The marker is the vendor's own error type, not prose.
+fn quota_exhausted(error: &ProviderError) -> bool {
+    error.status == 429
+        && (error.message.contains("FreeUsageLimitError")
+            || error
+                .error_body
+                .as_ref()
+                .is_some_and(|body| body.to_string().contains("FreeUsageLimitError")))
+}
+
+/// This exit IP's COUNTRY cannot answer the model at all. Like the free-quota
+/// 429 it is a statement about the lane, not the credential: the same key
+/// works from an allowed region, so the lane is pulled and the key is not
+/// cooled.
+fn region_blocked(error: &ProviderError) -> bool {
+    error.status == 403
+        && (error.message.contains("not available in your country")
+            || error
+                .error_body
+                .as_ref()
+                .is_some_and(|body| body.to_string().contains("RegionError")))
+}
+
 fn transient_vendor_error(error: &ProviderError) -> bool {
     match error.status {
         500 | 502 | 503 | 504 => true,
@@ -2810,6 +2850,49 @@ mod tests {
         assert!(done(&[b"data: {}\n\ndata: [DONE]\n\n"]));
         assert!(done(&[b"data: {}\n\nda", b"ta: [DONE]\n\n"]));
         assert!(!done(&[b"data: [DONE] suffix\n\n"]));
+    }
+
+    /// Both vendor refusals that are about the EXIT rather than the key:
+    /// the free-quota 429 and the country 403. Only the first is retryable
+    /// elsewhere on the same key; neither may cool it.
+    #[test]
+    fn exit_ip_verdicts_are_not_credential_verdicts() {
+        let quota = ProviderError::from_upstream(
+            "openai",
+            429,
+            br#"{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached."}}"#,
+        );
+        assert!(quota_exhausted(&quota), "{}", quota.message);
+        assert_eq!(
+            OpenAiProvider::cooldown(&quota),
+            Some(Duration::from_secs(30)),
+            "quota still parks the KEY for the usual window"
+        );
+
+        let region = ProviderError::from_upstream(
+            "openai",
+            403,
+            br#"{"type":"error","error":{"type":"RegionError","message":"This model is not available in your country"}}"#,
+        );
+        assert!(region_blocked(&region), "{}", region.message);
+        assert_eq!(
+            OpenAiProvider::cooldown(&region),
+            None,
+            "the key works elsewhere; only the exit's country is refused"
+        );
+
+        let auth = ProviderError::from_upstream(
+            "openai",
+            403,
+            br#"{"error":{"type":"AuthError","message":"invalid api key"}}"#,
+        );
+        assert!(!region_blocked(&auth));
+        assert!(!quota_exhausted(&auth));
+        assert_eq!(
+            OpenAiProvider::cooldown(&auth),
+            Some(Duration::from_secs(300)),
+            "a plain 403 is still an auth verdict"
+        );
     }
 
     #[test]
