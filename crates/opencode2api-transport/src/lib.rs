@@ -1323,10 +1323,31 @@ impl Transport {
         let Some((_, bounds)) = self.pool() else {
             return Err(ProviderError::unavailable("proxy pool unavailable").with_retry_after(5));
         };
-        let has_room = self.vendors.iter().enumerate().any(|(i, vendor)| {
+        let mut has_room = self.vendors.iter().enumerate().any(|(i, vendor)| {
             let max = bounds.get(i).map_or(0, |(_, max)| *max);
             guard.iter().filter(|l| l.vendor() == vendor.name()).count() < max
         });
+        // A ceiling full of dead exits is not full: the ceiling counts lanes,
+        // and a lane that cannot serve is not one. Retire the worst (a spent
+        // exit first, then an unhealthy one) and mint in its place NOW, so a
+        // quota 429 becomes a fresh attempt instead of a 503 while maintenance
+        // is still up to a tick away.
+        if !has_room
+            && let Some(idx) = guard
+                .iter()
+                .position(|l| l.spent.load(Ordering::Relaxed))
+                .or_else(|| guard.iter().position(|l| !l.is_healthy()))
+        {
+            let retired = guard.remove(idx);
+            metrics::counter!(names::RETIREMENTS, "vendor" => retired.vendor(), "reason" => "spent")
+                .increment(1);
+            tracing::info!(
+                vendor = retired.vendor(),
+                session = %retired.session(),
+                "proxy lane evicted for a replacement now"
+            );
+            has_room = true;
+        }
         let minted = if has_room {
             self.mint_for_vendor_with_room(&guard)
         } else {
@@ -1389,6 +1410,13 @@ impl Transport {
                 None
             }
         }
+    }
+
+    /// Whether this transport can replace a lane at all. Direct egress holds
+    /// one lane and no mechanism to mint another, so a policy that says "pull
+    /// this exit and try a fresh one" has nothing to act on there.
+    pub fn has_replaceable_lanes(&self) -> bool {
+        self.pool().is_some()
     }
 
     /// Could a request be served right now, without sending anything to find
@@ -1788,6 +1816,14 @@ impl Transport {
     #[doc(hidden)]
     pub async fn maintain_once_for_test(&self, probe: Option<&str>) {
         self.maintain(probe).await;
+    }
+
+    /// Snapshot of the lanes this pool holds. Hidden integration-test
+    /// affordance: the service crate asserts on the pool's shape but cannot
+    /// reach the internal lock.
+    #[doc(hidden)]
+    pub fn pool_lanes_read_for_test(&self) -> Vec<Arc<Lane>> {
+        self.pool_lanes().read().clone()
     }
 
     /// This pool's clock, so a lifecycle test can age its lanes without
@@ -2998,6 +3034,37 @@ mod tests {
         assert!(!lane.is_healthy(), "a success cannot un-spend an exit ip");
     }
 
+    /// A pool at its ceiling with a spent exit still has room: the lane that
+    /// cannot serve is evicted and a fresh session minted in the same call,
+    /// instead of shedding for a maintenance tick.
+    #[test]
+    fn a_full_pool_evicts_a_spent_lane_and_mints_now() {
+        let rt = lifecycle_runtime();
+        let proxy = rt.block_on(mock_proxy());
+        proxy.open();
+        let mut cfg = lifecycle_cfg(&proxy.url(), 3_600);
+        cfg.vendors[0].lanes = 1;
+        cfg.vendors[0].min_lanes = 1;
+        cfg.prewarm = false;
+        let transport = Transport::with_proxy(&lifecycle_server(), &cfg).unwrap();
+        let first = transport.pool_lanes().read()[0].clone();
+        first.note_spent();
+        let second = transport
+            .lane()
+            .expect("a spent exit is replaced, not shed");
+        assert!(!Arc::ptr_eq(&first, &second), "the request got a new lane");
+        assert_ne!(
+            first.session(),
+            second.session(),
+            "a new session is a new exit ip"
+        );
+        assert_eq!(
+            transport.pool_lanes().read().len(),
+            1,
+            "the ceiling still holds one lane"
+        );
+    }
+
     /// Direct egress has one lane and no replacement, so the signal must not
     /// flip it — the pool would stop serving with nothing to mint.
     #[test]
@@ -3275,11 +3342,16 @@ mod tests {
         );
     }
 
+    /// A ceiling full of dead lanes is not a capacity shed: the worst lane is
+    /// evicted and replaced, and that shows up as a `spent` retirement, not as
+    /// `lane_shed_total` — which would tell an operator to add capacity when
+    /// the pool simply had a dead exit in it.
     #[test]
-    fn at_ceiling_unhealthy_pool_sheds_for_all_vendors() {
+    fn an_unhealthy_pool_at_ceiling_evicts_and_counts_a_retirement() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
+        let mut before: Vec<String> = Vec::new();
         metrics::with_local_recorder(&recorder, || {
             let cfg = ProxyConfig {
                 vendors: vec![ProxyVendorConfig {
@@ -3291,33 +3363,42 @@ mod tests {
                 ..Default::default()
             };
             let transport = Transport::with_proxy(&ServerConfig::default(), &cfg).unwrap();
+            before = transport
+                .pool_lanes()
+                .read()
+                .iter()
+                .map(|l| l.session().to_string())
+                .collect();
             for lane in transport.pool_lanes().read().iter() {
                 for _ in 0..UNHEALTHY_AFTER {
                     lane.note_failure();
                 }
             }
-            assert_eq!(transport.lane().unwrap_err().status, 503);
+            let lane = transport.lane().expect("a dead lane is replaced, not shed");
+            assert_eq!(lane.vendor(), "vendor");
+            assert!(!before.contains(&lane.session().to_string()));
         });
-        let sheds = snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .filter_map(|(key, _, _, value)| {
-                let DebugValue::Counter(counter) = value else {
-                    return None;
-                };
-                (key.key().name() == names::SHED).then(|| {
-                    (
-                        key.key()
-                            .labels()
-                            .map(|l| (l.key().to_owned(), l.value().to_owned()))
-                            .collect::<Vec<_>>(),
-                        counter,
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(sheds, vec![(vec![("vendor".into(), "all".into())], 1)]);
+        let mut sheds = 0u64;
+        let mut spent_retirements = 0u64;
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            let DebugValue::Counter(counter) = value else {
+                continue;
+            };
+            let name = key.key().name();
+            let reason = key
+                .key()
+                .labels()
+                .find(|l| l.key() == "reason")
+                .map(|l| l.value().to_owned());
+            if name == names::SHED {
+                sheds += counter;
+            }
+            if name == names::RETIREMENTS && reason.as_deref() == Some("spent") {
+                spent_retirements += counter;
+            }
+        }
+        assert_eq!(sheds, 0, "a dead exit is not a capacity problem");
+        assert_eq!(spent_retirements, 1, "the eviction is counted");
     }
 
     #[test]
@@ -3489,21 +3570,54 @@ mod tests {
     /// mints a replacement instead — an unhealthy lane is a reason to get a
     /// new session, not a reason to fail.)
     #[test]
-    fn a_pool_with_no_healthy_lane_sheds_instead_of_leaking_the_origin_ip() {
+    fn a_pool_at_its_ceiling_replaces_a_dead_lane_instead_of_shedding() {
         let cfg = ProxyConfig {
             vendors: vec![ProxyVendorConfig {
                 lanes: 2,
-                min_lanes: 2, // at the ceiling: no headroom to mint into
+                min_lanes: 2, // at the ceiling: nothing to mint into normally
                 ..vendor_cfg("http://u-session-{session}:p@127.0.0.1:1")
             }],
             ..Default::default()
         };
         let t = Transport::with_proxy(&ServerConfig::default(), &cfg).unwrap();
+        let before: Vec<String> = t
+            .pool_lanes()
+            .read()
+            .iter()
+            .map(|l| l.session().to_string())
+            .collect();
         for lane in t.pool_lanes().read().iter() {
             for _ in 0..UNHEALTHY_AFTER {
                 lane.note_failure();
             }
         }
+        // A ceiling full of dead exits still has room: the dead lane is
+        // evicted and replaced, and the answer is still a PROXIED lane.
+        let lane = t.lane().expect("a dead lane is replaced, not shed");
+        assert_eq!(lane.vendor(), "test");
+        assert!(
+            !before.contains(&lane.session().to_string()),
+            "the replacement is a fresh session"
+        );
+        assert!(matches!(t.egress, Egress::Pool { .. }));
+    }
+
+    /// CONTRACT: a vendor that cannot mint still fails closed — the answer is a
+    /// retryable 503, never a direct-egress fallback that would leak the origin
+    /// IP.
+    #[test]
+    fn a_vendor_that_cannot_mint_answers_503_and_never_uses_direct_egress() {
+        let cfg = ProxyConfig {
+            vendors: vec![ProxyVendorConfig {
+                lanes: 1,
+                min_lanes: 0,
+                // The vendor leg only tunnels over http://, so this mint is a
+                // hard failure without needing a network.
+                ..vendor_cfg("socks5://u-session-{session}:p@127.0.0.1:1")
+            }],
+            ..Default::default()
+        };
+        let t = Transport::with_proxy(&ServerConfig::default(), &cfg).unwrap();
         let err = t.lane().unwrap_err();
         assert_eq!(err.status, 503);
         assert_eq!(err.retry_after, Some(5));

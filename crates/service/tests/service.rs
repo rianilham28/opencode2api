@@ -2155,31 +2155,24 @@ async fn a_dead_pool_renders_503_with_retry_after() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 503, "a dead pool fails closed");
-    assert_eq!(
-        resp.headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .map(|v| v.to_str().unwrap()),
-        Some("5"),
-        "a shed must tell the client when to come back"
-    );
-    let body: Value = resp.json().await.unwrap();
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("no healthy upstream proxy lane"),
-        "the client must learn it was shed, not that the vendor failed: {body}"
-    );
+    // A ceiling full of dead exits still has room: the dead lane is evicted
+    // and replaced, so this request is SERVED through the replacement rather
+    // than shed. What must never change is where it is served FROM — the
+    // replacement is another proxied lane, never the origin IP.
+    assert_eq!(resp.status(), 200, "a dead lane is replaced, not shed");
     assert_eq!(
         state.requests.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "nothing may be sent anywhere once the pool has shed"
+        1,
+        "the replacement carried the request to the upstream"
     );
-    assert!(
-        !pool.is_ready(),
-        "a pool with no healthy lane and no room left is not ready"
+    let lanes = pool.pool_lanes_read_for_test();
+    assert_eq!(lanes.len(), 1, "the ceiling still holds one lane");
+    assert_ne!(
+        lanes[0].session(),
+        lane.session(),
+        "the surviving lane is a fresh session, not the dead one"
     );
+    assert!(pool.is_ready());
 }
 
 /// (d) An upstream STATUS is the vendor's business, not the lane's.
