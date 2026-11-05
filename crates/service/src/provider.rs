@@ -1301,7 +1301,7 @@ impl OpenAiProvider {
                 });
         match gated {
             Ok(resp) => Ok((UpstreamResponse(resp), touch)),
-            Err(error) => {
+            Err(mut error) => {
                 let mut touch = touch;
                 // The free tier's allowance belongs to the EXIT IP, so its own
                 // `FreeUsageLimitError` is evidence about the lane and the
@@ -1310,6 +1310,15 @@ impl OpenAiProvider {
                 // into "replaced at the next maintenance tick".
                 if quota_exhausted(&error) || region_blocked(&error) {
                     touch.lane.note_spent();
+                }
+                if quota_exhausted(&error) {
+                    // The server loop's re-send cannot help: it would upload
+                    // the whole body again (median ~95k prompt tokens) onto an
+                    // exit that was just declared spent. Measured recoveries
+                    // from a quota 429: none, in 154 attempts. The client gets
+                    // the 429 and its own retry budget; the lane is already
+                    // rotating.
+                    error.retryable = false;
                 }
                 if touch.classify_body_error(&error) {
                     touch.transport_error();
@@ -2880,6 +2889,16 @@ mod tests {
             None,
             "the key works elsewhere; only the exit's country is refused"
         );
+
+        // The server loop must not re-send a quota 429: it re-uploads the
+        // whole body for an exit that is spent by construction.
+        let mut stopped = quota.clone();
+        stopped.retryable = false;
+        assert!(
+            !stopped.is_retryable(),
+            "the provider narrows the status policy for a spent exit"
+        );
+        assert!(quota.is_retryable(), "the status alone stays retryable");
 
         let auth = ProviderError::from_upstream(
             "openai",
