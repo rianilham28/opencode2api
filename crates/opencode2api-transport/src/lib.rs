@@ -123,6 +123,12 @@ pub mod names {
     /// Header-wait timeouts seen through a lane. Recorded, never counted
     /// against the lane: see `Lane::note_slow`.
     pub const SLOW: &str = "opencode2api_proxy_lane_timeouts_total";
+    /// Connections the vendor leg opened and reused, by lane vendor. The TLS
+    /// handshake is the cost the leg exists to pay down, so this is the pair
+    /// that says whether keep-alive is actually working.
+    pub const VENDOR_CONNS: &str = "opencode2api_vendor_connections_total";
+    /// Wall-clock TLS handshake time on the vendor leg, by lane vendor.
+    pub const VENDOR_HANDSHAKE: &str = "opencode2api_vendor_handshake_seconds";
 }
 
 /// Describe the egress metric family at recorder installation.
@@ -154,6 +160,14 @@ pub fn describe_metrics() {
     metrics::describe_counter!(
         names::SLOW,
         "Proxy lane response-header timeouts by vendor (vendor slowness, not a lane fault)"
+    );
+    metrics::describe_counter!(
+        names::VENDOR_CONNS,
+        "Vendor-leg connections by vendor and kind (new|reused)"
+    );
+    metrics::describe_histogram!(
+        names::VENDOR_HANDSHAKE,
+        "Vendor-leg TLS handshake seconds by vendor"
     );
 }
 

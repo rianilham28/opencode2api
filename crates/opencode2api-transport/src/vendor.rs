@@ -435,6 +435,12 @@ impl VendorClient {
                 None => None,
             };
             let reused = pooled.is_some();
+            metrics::counter!(
+                crate::names::VENDOR_CONNS,
+                "vendor" => lane.vendor(),
+                "kind" => if reused { "reused" } else { "new" },
+            )
+            .increment(1);
             let (slot, mut conn) = match pooled {
                 Some((slot, conn)) => (slot, conn),
                 None => {
@@ -546,6 +552,7 @@ impl VendorClient {
             .connector
             .configure()
             .map_err(|e| VendorError::lane(format!("TLS setup failed: {e}")))?;
+        let started = Instant::now();
         let tls = tokio::time::timeout(
             self.inner.connect_timeout,
             tokio_boring::connect(config, &host, tcp),
@@ -553,6 +560,14 @@ impl VendorClient {
         .await
         .map_err(|_| VendorError::lane("TLS handshake timed out"))?
         .map_err(|e| VendorError::lane(format!("TLS handshake failed: {e}")))?;
+        // TLS only: the TCP connect has its own budget and its own failure
+        // class, and folding it in would make a slow proxy look like a slow
+        // handshake.
+        metrics::histogram!(
+            crate::names::VENDOR_HANDSHAKE,
+            "vendor" => lane.vendor(),
+        )
+        .record(started.elapsed().as_secs_f64());
         Ok(Box::new(tls))
     }
 
