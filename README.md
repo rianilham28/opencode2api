@@ -291,6 +291,10 @@ Metrics worth alerting on:
   body that dies mid-flight) can retire an exit IP. A spike here is a slow
   upstream, not a dead proxy — retiring lanes on it is how three slow
   generations used to cost three healthy sessions.
+- `opencode2api_proxy_lane_quota_spent_total{vendor}` and
+  `opencode2api_proxy_lane_ip_rejected_total{vendor}` — lanes pulled because
+  their exit IP spent the vendor's free quota, and fresh sessions discarded
+  for landing on an already-spent IP (`ip_probe_url` only).
 - `opencode2api_vendor_connections_total{vendor,kind}` (`new|reused`) and
   `opencode2api_vendor_handshake_seconds{vendor}` — the vendor leg's own TLS
   cost. The handshake is the identity and the reason each lane is prewarmed;
@@ -542,6 +546,16 @@ What each part is defending:
 - **`{session}` is required.** Without it every lane shares one exit IP and
   rotation does nothing, so the config is rejected at boot rather than
   quietly degraded.
+- **`proxy.ip_probe_url` is OFF by default.** Set it (e.g. a plain-text
+  IP echo) and every freshly minted session is asked for its exit IP, so a
+  session that lands on an IP the pool already knows is spent is discarded
+  before it serves. It costs one small request per session — enable it on a
+  metered vendor only while debugging; the quota 429 itself costs nothing to
+  act on.
+- **A free-quota 429 pulls its lane.** When the vendor's envelope says
+  `FreeUsageLimitError`, the provider reports the lane as spent and the pool
+  replaces the session at its next tick instead of waiting for the TTL. The
+  exit IP is remembered (when known) and never adopted again.
 - **`{env:NAME}` names a secret instead of carrying it.** The value is read
   from the environment once at boot (so `.env` is the file that holds it, and
   the `proxy.vendors` block can be committed), an unset or empty variable

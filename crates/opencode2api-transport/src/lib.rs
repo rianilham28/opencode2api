@@ -129,6 +129,11 @@ pub mod names {
     pub const VENDOR_CONNS: &str = "opencode2api_vendor_connections_total";
     /// Wall-clock TLS handshake time on the vendor leg, by lane vendor.
     pub const VENDOR_HANDSHAKE: &str = "opencode2api_vendor_handshake_seconds";
+    /// Lanes pulled because their exit IP spent the vendor's free quota.
+    pub const QUOTA_SPENT: &str = "opencode2api_proxy_lane_quota_spent_total";
+    /// Freshly minted sessions discarded because their probed exit IP was
+    /// already known spent (`proxy.ip_probe_url` only).
+    pub const IP_REJECTED: &str = "opencode2api_proxy_lane_ip_rejected_total";
 }
 
 /// Describe the egress metric family at recorder installation.
@@ -168,6 +173,14 @@ pub fn describe_metrics() {
     metrics::describe_histogram!(
         names::VENDOR_HANDSHAKE,
         "Vendor-leg TLS handshake seconds by vendor"
+    );
+    metrics::describe_counter!(
+        names::QUOTA_SPENT,
+        "Proxy lanes pulled after their exit IP spent the free quota, by vendor"
+    );
+    metrics::describe_counter!(
+        names::IP_REJECTED,
+        "Fresh sessions discarded for landing on a known-spent exit IP, by vendor"
     );
 }
 
@@ -289,6 +302,15 @@ pub struct ProxyConfig {
     /// configuration, and the handshake it would have pre-paid is one that
     /// request was going to pay anyway.
     pub idle_retire_secs: u64,
+    /// URL probed THROUGH a lane to learn its exit IP, so a session that
+    /// lands on an already-spent exit is discarded before it serves.
+    ///
+    /// `None` BY DEFAULT, and deliberately: egress here is often billed by
+    /// data, and this probe is a request per session — a handshake plus a
+    /// round trip — paid on every rotation for a number the next 429 would
+    /// have told us anyway. Enable it on a metered vendor only while
+    /// debugging; the quota signal itself costs nothing to act on.
+    pub ip_probe_url: Option<String>,
     /// Send one cheap request down a new lane before it serves traffic, so
     /// the CONNECT + TLS handshake is spent off the request path.
     ///
@@ -307,6 +329,7 @@ impl std::fmt::Debug for ProxyConfig {
             .field("rotate_at_pct", &self.rotate_at_pct)
             .field("requests_per_lane", &self.requests_per_lane)
             .field("idle_retire_secs", &self.idle_retire_secs)
+            .field("ip_probe_url", &self.ip_probe_url)
             .field("prewarm", &self.prewarm)
             .finish()
     }
@@ -319,6 +342,7 @@ impl Default for ProxyConfig {
             rotate_at_pct: 80,
             requests_per_lane: 120,
             idle_retire_secs: 300,
+            ip_probe_url: None,
             prewarm: true,
         }
     }
@@ -412,6 +436,14 @@ impl ProxyConfig {
             self.requests_per_lane >= 1,
             "proxy.requests_per_lane >= 1 (0 would demand an unbounded pool)"
         );
+        if let Some(url) = self.ip_probe_url.as_deref().filter(|u| !u.is_empty()) {
+            let parsed = reqwest::Url::parse(url)
+                .map_err(|e| anyhow::anyhow!("proxy.ip_probe_url is not a usable URL ({e})"))?;
+            anyhow::ensure!(
+                matches!(parsed.scheme(), "http" | "https"),
+                "proxy.ip_probe_url must be http(s)"
+            );
+        }
         for (i, v) in self.vendors.iter().enumerate() {
             anyhow::ensure!(!v.name.is_empty(), "proxy.vendors[{i}]: name is required");
         }
@@ -632,6 +664,48 @@ type PoolBounds = [(usize, usize)];
 /// One warm client pinned to one proxy session. `Debug` prints the lane's
 /// identity only — the client it holds was built from a URL carrying a
 /// password, and that URL must not survive into a log line.
+/// Exit IPs that already answered the vendor's free-quota 429. Shared by
+/// every lane the pool mints: a fresh session that lands on one of them is
+/// discarded before it serves a single request, because the allowance belongs
+/// to the exit, not to the session id.
+///
+/// Bounded and deliberately forgetful: the quota resets on the vendor's own
+/// schedule, which this process cannot see, so a set that outgrew its cap is
+/// cleared rather than allowed to grow forever. The cost of forgetting is one
+/// wasted request on an IP that recovered.
+#[derive(Default)]
+pub struct SpentIps {
+    set: parking_lot::Mutex<std::collections::HashSet<String>>,
+}
+
+impl SpentIps {
+    const CAP: usize = 4096;
+
+    fn contains(&self, ip: &str) -> bool {
+        self.set.lock().contains(ip)
+    }
+
+    fn insert(&self, ip: &str) {
+        let mut set = self.set.lock();
+        if set.len() >= Self::CAP {
+            set.clear();
+        }
+        set.insert(ip.to_string());
+    }
+
+    /// How many exit IPs are currently known spent (test/diagnostic).
+    #[doc(hidden)]
+    pub fn len(&self) -> usize {
+        self.set.lock().len()
+    }
+
+    /// Whether the pool knows of any spent exit at all (test/diagnostic).
+    #[doc(hidden)]
+    pub fn is_empty(&self) -> bool {
+        self.set.lock().is_empty()
+    }
+}
+
 pub struct Lane {
     /// One client per shard. Same proxy session in every one, so they share
     /// an exit IP and differ only in which connection a request rides.
@@ -651,7 +725,18 @@ pub struct Lane {
     last_used_secs: AtomicU64,
     inflight: AtomicUsize,
     ttl: Duration,
+    /// The exit IP this lane egresses from, learned once by a probe through
+    /// the lane itself. `OnceLock`: a session's exit does not change.
+    exit_ip: std::sync::OnceLock<String>,
+    /// The pool-wide set of exit IPs already known to have spent the
+    /// vendor's free quota — what `note_spent` records and what a freshly
+    /// minted session is checked against before it is adopted.
+    spent_ips: Arc<SpentIps>,
     healthy: AtomicBool,
+    /// The exit IP spent the vendor's free-tier quota. Separate from
+    /// `healthy` so a later success on the same lane cannot revive it: the
+    /// allowance belongs to the exit, and only a new session gets a new one.
+    spent: AtomicBool,
     consecutive_failures: AtomicU32,
     /// Only a pooled lane can be pulled from rotation and retired. Direct
     /// egress has one lane and no replacement, so a health flip there would be
@@ -820,8 +905,43 @@ impl Lane {
 
     /// Record that handoff proved the tunnel reachable without declaring the
     /// request complete; sequential body failures must still accumulate.
+    /// The exit IP this lane egresses from, once a probe has learned it.
+    /// `None` when exit-IP tracking is disabled or the probe failed.
+    pub fn exit_ip(&self) -> Option<&str> {
+        self.exit_ip.get().map(String::as_str)
+    }
+
+    fn set_exit_ip(&self, ip: &str) {
+        let _ = self.exit_ip.set(ip.to_string());
+    }
+
     pub fn note_healthy(&self) {
         self.healthy.store(true, Ordering::Relaxed);
+    }
+
+    /// The exit IP spent the vendor's free-tier quota. This is not a failure
+    /// COUNT — the vendor's own answer says this exit has nothing left — so
+    /// the lane is pulled on the spot and maintenance replaces it with a
+    /// fresh session (a fresh exit) at its next tick.
+    ///
+    /// Deliberately not a transport failure: the tunnel was fine, the quota
+    /// was not. The provider reports this one because only it can read the
+    /// vendor's envelope; the pool supplies the mechanism.
+    pub fn note_spent(&self) {
+        if let Some(ip) = self.exit_ip() {
+            self.spent_ips.insert(ip);
+        }
+        if !self.rotatable {
+            return;
+        }
+        if !self.spent.swap(true, Ordering::Relaxed) {
+            metrics::counter!(names::QUOTA_SPENT, "vendor" => self.vendor).increment(1);
+            tracing::warn!(
+                vendor = self.vendor,
+                session = %self.session,
+                "exit ip spent its free-tier quota; pulling the lane"
+            );
+        }
     }
 
     /// Mark a handed-off lane complete before recording its outcome.
@@ -864,7 +984,7 @@ impl Lane {
     }
 
     fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Relaxed)
+        self.healthy.load(Ordering::Relaxed) && !self.spent.load(Ordering::Relaxed)
     }
 
     fn has_handoff_time(&self, floor: Duration) -> bool {
@@ -926,6 +1046,12 @@ pub struct Transport {
     /// written only from the maintenance pass, so a plain mutex over a small
     /// vector: one lock per tick is cheaper than an atomic per vendor.
     rotation_backoff: Mutex<Vec<RotationBackoff>>,
+    /// Exit IPs known to have spent the vendor's free quota, shared by every
+    /// lane this pool mints. See [`SpentIps`].
+    spent_ips: Arc<SpentIps>,
+    /// Where a lane learns its exit IP, when the operator opted in. `None`
+    /// keeps the pool off the network except for real traffic.
+    ip_probe_url: Option<String>,
     /// The vendor leg's TLS context, built once on first use. It is a plain
     /// [`std::sync::OnceLock`] rather than a constructor argument so that
     /// `Transport::direct` stays infallible for callers that never touch the
@@ -1035,7 +1161,10 @@ impl Transport {
             last_used_secs: AtomicU64::new(0),
             inflight: AtomicUsize::new(0),
             ttl: Duration::MAX,
+            exit_ip: std::sync::OnceLock::new(),
+            spent_ips: Arc::new(SpentIps::default()),
             healthy: AtomicBool::new(true),
+            spent: AtomicBool::new(false),
             consecutive_failures: AtomicU32::new(0),
             rotatable: false,
             vendor_proxy: None,
@@ -1057,6 +1186,8 @@ impl Transport {
             maintenance_started: AtomicBool::new(false),
             maintenance_handle: Mutex::new(None),
             rotation_backoff: Mutex::new(Vec::new()),
+            spent_ips: Arc::new(SpentIps::default()),
+            ip_probe_url: None,
             vendor: std::sync::OnceLock::new(),
         })
     }
@@ -1096,6 +1227,8 @@ impl Transport {
                     .map(|_| RotationBackoff::default())
                     .collect(),
             ),
+            spent_ips: Arc::new(SpentIps::default()),
+            ip_probe_url: cfg.ip_probe_url.clone(),
             vendor: std::sync::OnceLock::new(),
         });
 
@@ -1378,7 +1511,10 @@ impl Transport {
             last_used_secs: AtomicU64::new(0),
             inflight: AtomicUsize::new(0),
             ttl: vendor.session_ttl(),
+            exit_ip: std::sync::OnceLock::new(),
+            spent_ips: self.spent_ips.clone(),
             healthy: AtomicBool::new(true),
+            spent: AtomicBool::new(false),
             consecutive_failures: AtomicU32::new(0),
             rotatable: true,
             vendor_proxy,
@@ -1513,20 +1649,37 @@ impl Transport {
                 continue;
             }
             let vendor = self.vendors[vendor_index].clone();
-            let replacement = match self.mint_lane(&vendor, idx as u64) {
-                Ok(l) => l,
-                Err(e) => {
-                    metrics::counter!(names::MINT_FAILURES, "vendor" => old.vendor()).increment(1);
-                    self.note_rotation_failure(vendor_index);
-                    tracing::error!(vendor = old.vendor(), error = %e, "minting a lane failed");
-                    continue;
+            let mut replacement: Option<Arc<Lane>> = None;
+            for attempt in 0..IP_MINT_ATTEMPTS {
+                let candidate = match self.mint_lane(&vendor, idx as u64 + attempt as u64) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        metrics::counter!(names::MINT_FAILURES, "vendor" => old.vendor())
+                            .increment(1);
+                        self.note_rotation_failure(vendor_index);
+                        tracing::error!(vendor = old.vendor(), error = %e, "minting a lane failed");
+                        break;
+                    }
+                };
+                match self.warm(&candidate, vendor.as_ref(), probe).await {
+                    Warm::Adopted => {
+                        replacement = Some(candidate);
+                        break;
+                    }
+                    // The session landed on an exit the pool already knows is
+                    // spent: this mint costs one probe, not a rotation failure.
+                    Warm::Discard => continue,
+                    Warm::Failed => {
+                        metrics::counter!(names::ROTATION_FAILURES, "vendor" => old.vendor())
+                            .increment(1);
+                        self.note_rotation_failure(vendor_index);
+                        break;
+                    }
                 }
-            };
-            if !self.warm(&replacement, vendor.as_ref(), probe).await {
-                metrics::counter!(names::ROTATION_FAILURES, "vendor" => old.vendor()).increment(1);
-                self.note_rotation_failure(vendor_index);
-                continue;
             }
+            let Some(replacement) = replacement else {
+                continue;
+            };
             let mut guard = lanes.write();
             if !Self::replace_if_identity(&mut guard, idx, &old, replacement) {
                 // A concurrent identity change means another actor already
@@ -1559,15 +1712,30 @@ impl Transport {
             if self.rotation_wait(vendor_index).is_some() {
                 break;
             }
-            let Some(lane) = self.mint_for(vendor_index, held.len() as u64) else {
-                self.note_rotation_failure(vendor_index);
+            let vendor = self.vendors[vendor_index].clone();
+            let mut adopted: Option<Arc<Lane>> = None;
+            for attempt in 0..IP_MINT_ATTEMPTS {
+                let Ok(candidate) = self.mint_lane(&vendor, held.len() as u64 + attempt as u64)
+                else {
+                    metrics::counter!(names::MINT_FAILURES, "vendor" => vendor.name()).increment(1);
+                    self.note_rotation_failure(vendor_index);
+                    break;
+                };
+                match self.warm(&candidate, vendor.as_ref(), probe).await {
+                    Warm::Adopted => {
+                        adopted = Some(candidate);
+                        break;
+                    }
+                    Warm::Discard => continue,
+                    Warm::Failed => {
+                        self.note_rotation_failure(vendor_index);
+                        break;
+                    }
+                }
+            }
+            let Some(lane) = adopted else {
                 break;
             };
-            let vendor = self.vendors[vendor_index].clone();
-            if !self.warm(&lane, vendor.as_ref(), probe).await {
-                self.note_rotation_failure(vendor_index);
-                break;
-            }
             self.note_rotation_success(vendor_index);
             lanes.write().push(lane);
         }
@@ -1642,9 +1810,23 @@ impl Transport {
     /// deliberate and priced: this is N probes, and `opencode2api_proxy_prewarm_total`
     /// counts probes, not lanes, so a metered vendor with `shards: 4` must be
     /// priced at 4× the per-lane figure.
-    async fn warm(&self, lane: &Arc<Lane>, vendor: &dyn ProxyVendor, probe: Option<&str>) -> bool {
+    async fn warm(&self, lane: &Arc<Lane>, vendor: &dyn ProxyVendor, probe: Option<&str>) -> Warm {
+        // Exit-IP first, and regardless of prewarm: it is IDENTITY, not
+        // warming. A session whose exit already spent the quota is discarded
+        // here — before it carries a single request — and the caller mints
+        // another one.
+        if let Some(true) = self.probed_ip_is_spent(lane).await {
+            metrics::counter!(names::IP_REJECTED, "vendor" => lane.vendor()).increment(1);
+            tracing::info!(
+                vendor = lane.vendor(),
+                session = %lane.session(),
+                ip = lane.exit_ip().unwrap_or("-"),
+                "fresh session landed on a spent exit ip; discarding"
+            );
+            return Warm::Discard;
+        }
         let Some(url) = probe.filter(|_| self.wants_prewarm(vendor)) else {
-            return true;
+            return Warm::Adopted;
         };
         let mut proved = true;
         for client in lane.shard_clients() {
@@ -1689,7 +1871,53 @@ impl Transport {
                 ),
             }
         }
-        proved
+        if proved { Warm::Adopted } else { Warm::Failed }
+    }
+
+    /// Learn this lane's exit IP through the lane itself and answer whether
+    /// the pool already knows it as spent. `None` = no IP knowledge (tracking
+    /// disabled, or the probe failed — which is not a lane verdict).
+    ///
+    /// The probe is one plain-text GET with a ~15-byte reply: the cheapest
+    /// thing that names the exit. It costs a handshake per new session, which
+    /// rotation already pays for its own warm pass.
+    async fn probed_ip_is_spent(&self, lane: &Arc<Lane>) -> Option<bool> {
+        if lane.exit_ip().is_some() {
+            return Some(self.spent_ips.contains(lane.exit_ip()?));
+        }
+        let url = self.ip_probe_url.as_deref().filter(|u| !u.is_empty())?;
+        let client = lane.client();
+        let sent = tokio::time::timeout(
+            Duration::from_secs(self.server.connect_timeout_secs),
+            client.get(url).send(),
+        )
+        .await;
+        let Ok(Ok(resp)) = sent else {
+            tracing::debug!(vendor = lane.vendor(), "exit-ip probe did not answer");
+            return None;
+        };
+        let body = match resp.bytes().await {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::debug!(vendor = lane.vendor(), error = %e, "exit-ip probe body failed");
+                return None;
+            }
+        };
+        // The echo service answers with the address and nothing else; a
+        // larger body is somebody else's page, not an address.
+        let text = std::str::from_utf8(&body[..body.len().min(64)]).ok()?;
+        let ip = text.trim().lines().next()?.trim();
+        if ip.parse::<std::net::IpAddr>().is_err() {
+            tracing::debug!(
+                vendor = lane.vendor(),
+                body = text,
+                "exit-ip probe did not answer with an address"
+            );
+            return None;
+        }
+        lane.set_exit_ip(ip);
+        tracing::debug!(vendor = lane.vendor(), session = %lane.session(), ip, "exit ip learned");
+        Some(self.spent_ips.contains(ip))
     }
 
     /// The one place that answers "should this vendor be warmed?", so boot
@@ -1861,6 +2089,22 @@ async fn drain(sent: Result<reqwest::Response, reqwest::Error>) -> Result<(), re
     Ok(())
 }
 
+/// How a warm pass ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Warm {
+    /// Ready to serve.
+    Adopted,
+    /// The freshly minted session's exit IP already spent the vendor's free
+    /// quota. Not a vendor failure and not a lane failure: mint another.
+    Discard,
+    /// The probe itself failed — a transport problem, charged to rotation.
+    Failed,
+}
+
+/// Fresh mints one rotation will spend looking for a non-spent exit IP before
+/// it gives up until the next tick.
+const IP_MINT_ATTEMPTS: usize = 4;
+
 /// What a failed `send()` says about the lane that carried it.
 ///
 /// `reqwest` flattens three different worlds into one error, and the pool's
@@ -2022,7 +2266,10 @@ mod tests {
             last_used_secs: AtomicU64::new(0),
             inflight: AtomicUsize::new(0),
             ttl,
+            exit_ip: std::sync::OnceLock::new(),
+            spent_ips: Arc::new(SpentIps::default()),
             healthy: AtomicBool::new(true),
+            spent: AtomicBool::new(false),
             consecutive_failures: AtomicU32::new(0),
             rotatable: true,
             vendor_proxy: None,
@@ -2120,6 +2367,32 @@ mod tests {
             !err.contains("proxy.proxiware.com"),
             "the url must not leak: {err}"
         );
+    }
+
+    /// The exit-IP probe is opt-in and validated: a typo must fail boot, and
+    /// an absent field must mean "spend nothing".
+    #[test]
+    fn the_ip_probe_url_is_optional_and_validated() {
+        let _lock = env_lock();
+        let _env = EnvGuard::set(&[]);
+        let vendor = serde_json::json!({"name": "v", "url": "http://u:{session}@h:1"});
+        let cfg =
+            ProxyConfig::from_doc(&serde_json::json!({"proxy": {"vendors": [vendor.clone()]}}))
+                .expect("defaults are valid")
+                .expect("a pool");
+        assert!(cfg.ip_probe_url.is_none(), "off unless configured");
+        let cfg = ProxyConfig::from_doc(&serde_json::json!({
+            "proxy": {"ip_probe_url": "https://api.ipify.org", "vendors": [vendor.clone()]}
+        }))
+        .expect("an https probe is valid")
+        .expect("a pool");
+        assert_eq!(cfg.ip_probe_url.as_deref(), Some("https://api.ipify.org"));
+        let err = ProxyConfig::from_doc(&serde_json::json!({
+            "proxy": {"ip_probe_url": "not a url", "vendors": [vendor]}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ip_probe_url"), "{err}");
     }
 
     #[test]
@@ -2696,6 +2969,45 @@ mod tests {
             UNHEALTHY_AFTER
         );
         assert!(lane.idle_age_for_test() >= Duration::from_secs(2));
+    }
+
+    /// A spent exit IP is pulled at once and a later success does not revive
+    /// it: the allowance belongs to the exit, and only a new session gets one.
+    #[test]
+    fn a_spent_exit_ip_is_pulled_and_not_revived_by_a_success() {
+        let lane = test_lane(Duration::from_secs(3_600), "spent");
+        lane.set_exit_ip("203.0.113.7");
+        assert!(lane.is_healthy());
+        lane.note_spent();
+        assert!(!lane.is_healthy(), "one quota 429 pulls the lane, no count");
+        assert_eq!(lane.exit_ip(), Some("203.0.113.7"));
+        assert_eq!(
+            lane.spent_ips.len(),
+            1,
+            "the exit ip is remembered for every later mint"
+        );
+        lane.note_healthy();
+        assert!(!lane.is_healthy(), "a success cannot un-spend an exit ip");
+    }
+
+    /// Direct egress has one lane and no replacement, so the signal must not
+    /// flip it — the pool would stop serving with nothing to mint.
+    #[test]
+    fn a_direct_lane_is_never_pulled_by_a_spent_ip() {
+        let transport = Transport::direct(&ServerConfig::default());
+        let lane = transport.lane().unwrap();
+        lane.note_spent();
+        assert!(lane.is_healthy());
+    }
+
+    /// Exit-IP probing is OFF unless configured: no probe URL means no
+    /// request is spent learning an address the next 429 names for free.
+    #[tokio::test]
+    async fn exit_ip_probe_is_silent_when_disabled() {
+        let transport = Transport::direct(&ServerConfig::default());
+        let lane = transport.lane().unwrap();
+        assert_eq!(transport.probed_ip_is_spent(&lane).await, None);
+        assert_eq!(lane.exit_ip(), None);
     }
 
     /// CONTRACT (W10e): three slow UPSTREAM generations must not retire three

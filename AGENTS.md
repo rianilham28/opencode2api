@@ -445,12 +445,17 @@ truth for which; README "Quick start" lists the common ones.
   body → 200; a body without the pair, without `stream:true`, or without a
   `read` tool → 403/429. The UA is shape-only (`opencode/x/y`), the tag name
   is exact, the path value is free, and no output cap is invented.
-- **Only transport failures are the lane's fault.** `Lane::note_failure` is
-  for CONNECT and tunnel errors, plus a body that dies mid-flight. An upstream
-  429 or 500 arrived THROUGH a working lane and says nothing about the exit IP
-  — attributing those would retire healthy lanes every time the vendor
-  rate-limits you. Three consecutive transport failures retire a lane; the
-  maintenance loop replaces it.
+- **Only transport failures are the lane's fault — plus the vendor's own
+  per-exit quota verdict.** `Lane::note_failure` is for CONNECT and tunnel
+  errors, plus a body that dies mid-flight. An upstream 429 or 500 arrived
+  THROUGH a working lane and says nothing about the exit IP — attributing
+  those would retire healthy lanes every time the vendor rate-limits you.
+  Three consecutive transport failures retire a lane; the maintenance loop
+  replaces it. The ONE exception is a vendor whose free quota belongs to the
+  exit: its `FreeUsageLimitError` is a statement about the IP, so the provider
+  reports it with `Lane::note_spent` (immediate, no failure count) and the
+  pool replaces the session. `note_spent` also records the exit IP when one is
+  known, so a later mint that lands on that IP is discarded before it serves.
 - **A slow upstream is not a dead exit IP.** `reqwest` reports the read
   timeout (the 120 s header wait) as a timeout and cannot tell it from a dead
   one, so `classify_send` splits them: a connect fault is the lane's, a
