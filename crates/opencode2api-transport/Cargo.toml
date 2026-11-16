@@ -30,5 +30,5 @@ webpki-root-certs = { workspace = true }
 http = { workspace = true }
 
 [dev-dependencies]
-md5 = "0.7"
+md5 = "0.8"
 metrics-util = { version = "0.20.4", features = ["debugging"] }
