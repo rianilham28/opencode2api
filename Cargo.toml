@@ -87,7 +87,7 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 anyhow = "1.0.104"
 clap = { version = "4", features = ["derive", "env"] }
 mimalloc = { version = "0.1.52", default-features = false }
-jiff = { version = "0.2.35", features = ["tz-system"] }
+jiff = { version = "1.0.1", features = ["tz-system"] }
 parking_lot = "0.12"
 
 [profile.dev]
